@@ -146,6 +146,12 @@ Default = ticked when the window opens. Everything is explained again inside the
   That is cosmetic. If the ESU enrolment wizard ever refuses with a similar message, run **Revert hardening**
   (which removes those policy values), enrol, then run the hardening again.
 
+## License
+
+Free software under the **GNU General Public License v3.0** (or any later version) - see [LICENSE](LICENSE).
+The tool is provided *without any warranty*; it changes system security settings, so read the task
+descriptions and keep the restore point it creates.
+
 ## Sources
 
 * Microsoft - [Windows 10 Extended Security Updates](https://www.microsoft.com/windows/extended-security-updates)

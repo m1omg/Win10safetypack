@@ -39,6 +39,9 @@
 .NOTES
     Requires Windows 10 (22H2 recommended), Windows PowerShell 5.1 and administrator rights.
     Tested approach: Windows Forms GUI + background runspace so the window stays responsive.
+
+    Copyright (C) 2026 m1omg. Licensed under the GNU General Public License v3.0 or later;
+    see the LICENSE file or https://www.gnu.org/licenses/gpl-3.0.html. Provided WITHOUT ANY WARRANTY.
 #>
 [CmdletBinding()]
 param(
