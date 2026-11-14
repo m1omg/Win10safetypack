@@ -50,7 +50,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ToolVersion = '1.0.0'
+$script:ToolVersion = '1.0.1'
 
 # ===========================================================================================
 #  Task catalogue (data only - the implementation is in the Task-<Id> functions below)
@@ -150,6 +150,9 @@ Registry changes (the previous values are backed up for "Revert hardening"):
   - prevents WDigest from caching clear-text passwords, restricts anonymous SAM enumeration,
   - enables LSA Protection (RunAsPPL), which shields the logon process from credential-dumping tools.
 Explorer changes show after the next sign-in; LSA Protection needs a restart.
+Note: on a PC with UEFI Secure Boot, Windows may also store the LSA Protection setting in the firmware;
+"Revert hardening" restores the registry value, but LSA Protection can then stay on until it is cleared
+with Microsoft's "LSA Protected Process Opt-out" tool.
 '@
     },
     [pscustomobject]@{
@@ -409,6 +412,31 @@ function Add-Advice {
     if (-not $sync.Advice.Contains($Text)) { [void]$sync.Advice.Add($Text) }
 }
 
+# ---- JSON backup files --------------------------------------------------------------------
+function Expand-JsonNode {
+    # Emits the objects below $Node one by one. Unwraps arrays nested inside arrays and the
+    # {"value":[...],"Count":n} wrapper Windows PowerShell 5.1 writes for an array it got from a cmdlet;
+    # backup files written by version 1.0.0 can contain both.
+    param($Node)
+    if ($null -eq $Node) { return }
+    if ($Node -is [array]) { foreach ($child in $Node) { Expand-JsonNode $child }; return }
+    if ($Node -is [string] -or $Node -is [ValueType]) { return }
+    $names = @($Node.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($names.Count -eq 2 -and $names -contains 'value' -and $names -contains 'Count') { Expand-JsonNode $Node.value; return }
+    $Node
+}
+
+function Read-JsonArray {
+    # Reads a JSON file that holds an array of objects; use as  $list = @(Read-JsonArray $file).
+    # Do not replace this with @(... | ConvertFrom-Json): Windows PowerShell 5.1 sends a JSON array down the
+    # pipeline as ONE object (PowerShell 7 enumerates it), so that expression yields a 1-element array there.
+    param([Parameter(Mandatory)][string]$File)
+    $text = Get-Content -LiteralPath $File -Raw
+    if ([string]::IsNullOrWhiteSpace($text)) { return }
+    $parsed = ConvertFrom-Json -InputObject $text
+    Expand-JsonNode $parsed
+}
+
 # ---- registry with backup -----------------------------------------------------------------
 function Get-RegBackupPath { Join-Path $sync.StateDir 'registry-backup.json' }
 
@@ -417,7 +445,12 @@ function Add-RegBackupEntry {
     $file = Get-RegBackupPath
     $list = @()
     if (Test-Path -LiteralPath $file) {
-        try { $list = @((Get-Content -LiteralPath $file -Raw) | ConvertFrom-Json) } catch { $list = @() }
+        try { $list = @(Read-JsonArray $file) }
+        catch {
+            # Unreadable backup: set it aside instead of overwriting it, then start a new one.
+            try { Move-Item -LiteralPath $file -Destination ($file + '.unreadable_' + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force } catch { }
+            $list = @()
+        }
     }
     foreach ($e in $list) { if ($e.Path -eq $Path -and $e.Name -eq $Name) { return } }
 
@@ -537,6 +570,15 @@ function Get-ProgramFilesDirs {
     return @($env:ProgramFiles, ${env:ProgramFiles(x86)} | Where-Object { $_ } | Select-Object -Unique)
 }
 
+function Test-MalwarebytesInstalled {
+    # The main executable is not named the same in every Malwarebytes version, so accept any of these.
+    $dir = Join-Path $env:ProgramFiles 'Malwarebytes\Anti-Malware'
+    foreach ($exe in @('mbam.exe', 'Malwarebytes.exe', 'MBAMService.exe')) {
+        if (Test-Path -LiteralPath (Join-Path $dir $exe)) { return $true }
+    }
+    return $false
+}
+
 # ---- winget -------------------------------------------------------------------------------
 function Get-WingetPath {
     $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -636,7 +678,8 @@ function Get-SystemStatus {
                     $candidates += $h
                 }
             }
-            if ($candidates.Count -gt 0) { $last = ($candidates | Sort-Object Date -Descending)[0] }
+            # Select-Object rather than [0]: with a single entry Sort-Object returns a bare COM object, not an array.
+            if ($candidates.Count -gt 0) { $last = $candidates | Sort-Object Date -Descending | Select-Object -First 1 }
         }
         if ($last) {
             $age = (New-TimeSpan -Start $last.Date -End (Get-Date)).Days
@@ -653,12 +696,13 @@ function Get-SystemStatus {
         $rtOk = [bool]$mp.RealTimeProtectionEnabled
         $modeOk = ($mp.AMRunningMode -eq 'Normal')
         Add-StatusItem 'Defender Antivirus' ('mode: {0}; real-time protection: {1}; platform {2}' -f $mp.AMRunningMode, $(if ($rtOk) { 'on' } else { 'OFF' }), $mp.AMProductVersion) $(if ($rtOk -and $modeOk) { 'ok' } else { 'bad' })
-        $sigAge = [int]$mp.AntivirusSignatureAge
+        $sigAge = [long]$mp.AntivirusSignatureAge   # UInt32; 4294967295 when there are no definitions, which does not fit an [int]
         Add-StatusItem 'Defender definitions' ('version {0}, updated {1:yyyy-MM-dd HH:mm} ({2} day(s) old)' -f $mp.AntivirusSignatureVersion, $mp.AntivirusSignatureLastUpdated, $sigAge) $(if ($sigAge -le 3) { 'ok' } else { 'warn' })
         Add-StatusItem 'Defender tamper protection' $(if ($mp.IsTamperProtected) { 'on' } else { 'OFF - turn on in Windows Security > Virus & threat protection > Manage settings' }) $(if ($mp.IsTamperProtected) { 'ok' } else { 'warn' })
         $cloud = ([int]$pref.MAPSReporting -gt 0); $pua = ([int]$pref.PUAProtection -eq 1); $np = ([int]$pref.EnableNetworkProtection -eq 1)
         Add-StatusItem 'Defender cloud / PUA / network protection' ('cloud protection {0}; PUA blocking {1}; network protection {2}' -f $(if ($cloud) { 'on' } else { 'off' }), $(if ($pua) { 'on' } else { 'off' }), $(if ($np) { 'on' } else { 'off' })) $(if ($cloud -and $pua -and $np) { 'ok' } else { 'warn' })
-        $ids = @($pref.AttackSurfaceReductionRules_Ids); $acts = @($pref.AttackSurfaceReductionRules_Actions)
+        $ids = @($pref.AttackSurfaceReductionRules_Ids | Where-Object { $_ })
+        $acts = @($pref.AttackSurfaceReductionRules_Actions | Where-Object { $null -ne $_ })
         $asrBlock = 0
         for ($i = 0; $i -lt $ids.Count; $i++) { if ($i -lt $acts.Count -and [int]$acts[$i] -eq 1) { $asrBlock++ } }
         Add-StatusItem 'Attack Surface Reduction rules' ('{0} configured, {1} in block mode' -f $ids.Count, $asrBlock) $(if ($asrBlock -ge 10) { 'ok' } else { 'warn' })
@@ -703,7 +747,7 @@ function Get-SystemStatus {
     if (-not $zp) { $zp = Get-Service | Where-Object { $_.DisplayName -like '*0patch*' } | Select-Object -First 1 }
     Add-StatusItem '0patch Agent' $(if ($zp) { 'installed (service {0}: {1})' -f $zp.Name, $zp.Status } else { 'not installed' }) $(if ($zp) { 'ok' } else { 'info' })
 
-    $mb = Test-Path -LiteralPath (Join-Path $env:ProgramFiles 'Malwarebytes\Anti-Malware\mbam.exe')
+    $mb = Test-MalwarebytesInstalled
     Add-StatusItem 'Malwarebytes' $(if ($mb) { 'installed' } else { 'not installed' }) $(if ($mb) { 'ok' } else { 'info' })
 
     $wg = Get-WingetPath
@@ -844,8 +888,9 @@ function Task-asr {
     $backup = Join-Path $sync.StateDir 'asr-backup.json'
     if (-not (Test-Path -LiteralPath $backup)) {
         $saved = [pscustomobject]@{
-            Ids     = @($pref.AttackSurfaceReductionRules_Ids)
-            Actions = @($pref.AttackSurfaceReductionRules_Actions | ForEach-Object { [int]$_ })
+            # @($null) would be a 1-element array, so drop the null a PC without ASR rules returns.
+            Ids     = @($pref.AttackSurfaceReductionRules_Ids | Where-Object { $_ })
+            Actions = @($pref.AttackSurfaceReductionRules_Actions | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
             Saved   = (Get-Date).ToString('s')
         }
         ConvertTo-Json -InputObject $saved -Depth 4 | Set-Content -LiteralPath $backup -Encoding UTF8
@@ -891,7 +936,9 @@ function Task-legacy {
     $features = @('SMB1Protocol', 'SMB1Protocol-Client', 'SMB1Protocol-Server', 'SMB1Protocol-Deprecation',
                   'MicrosoftWindowsPowerShellV2Root', 'MicrosoftWindowsPowerShellV2')
     foreach ($name in $features) {
-        $feat = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction SilentlyContinue
+        # A feature this Windows build does not have must be skipped, whichever way DISM reports it.
+        $feat = $null
+        try { $feat = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction Stop } catch { $feat = $null }
         if (-not $feat) { continue }
         if ($feat.State -eq 'Enabled') {
             Write-Log "  disabling optional feature $name ..."
@@ -974,17 +1021,29 @@ function Task-dns {
     $adapters = @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' })
     if ($adapters.Count -eq 0) { throw 'No active physical network adapter found.' }
 
-    if (-not (Test-Path -LiteralPath $file)) {
-        $backup = @()
-        foreach ($a in $adapters) {
-            $g = $a.InterfaceGuid
-            $v4 = $null; $v6 = $null
-            try { $v4 = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$g" -Name NameServer -ErrorAction Stop).NameServer } catch { }
-            try { $v6 = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$g" -Name NameServer -ErrorAction Stop).NameServer } catch { }
-            $servers = @()
-            foreach ($s in @($v4, $v6)) { if ($s) { $servers += @($s -split '[,\s]+' | Where-Object { $_ }) } }
-            $backup += [pscustomobject]@{ InterfaceIndex = $a.InterfaceIndex; Name = $a.Name; Guid = $g; StaticServers = $servers; Saved = (Get-Date).ToString('s') }
-        }
+    # Save the current servers of every adapter that is not in the backup yet (an adapter that was offline
+    # during an earlier run must be saved now, or "Revert hardening" would leave it on Quad9).
+    $backup = @()
+    $backupReadable = $true
+    if (Test-Path -LiteralPath $file) {
+        try { $backup = @(Read-JsonArray $file) }
+        catch { $backupReadable = $false; Write-Log "  the existing DNS backup $file could not be read and is left untouched: $($_.Exception.Message)" Warn }
+    }
+    $knownGuids = @($backup | ForEach-Object { $_.Guid })
+    $added = 0
+    foreach ($a in $adapters) {
+        if (-not $backupReadable) { break }
+        $g = $a.InterfaceGuid
+        if ($knownGuids -contains $g) { continue }
+        $v4 = $null; $v6 = $null
+        try { $v4 = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$g" -Name NameServer -ErrorAction Stop).NameServer } catch { }
+        try { $v6 = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$g" -Name NameServer -ErrorAction Stop).NameServer } catch { }
+        $servers = @()
+        foreach ($s in @($v4, $v6)) { if ($s) { $servers += @($s -split '[,\s]+' | Where-Object { $_ }) } }
+        $backup += [pscustomobject]@{ InterfaceIndex = $a.InterfaceIndex; Name = $a.Name; Guid = $g; StaticServers = $servers; Saved = (Get-Date).ToString('s') }
+        $added++
+    }
+    if ($added -gt 0) {
         ConvertTo-Json -InputObject @($backup) -Depth 4 | Set-Content -LiteralPath $file -Encoding UTF8
         Write-Log "  previous DNS settings saved to $file" Debug
     }
@@ -1001,18 +1060,23 @@ function Task-dns {
 function Restore-DnsBackup {
     $file = Join-Path $sync.StateDir 'dns-backup.json'
     if (-not (Test-Path -LiteralPath $file)) { return }
-    $entries = @((Get-Content -LiteralPath $file -Raw) | ConvertFrom-Json)
+    $entries = @(Read-JsonArray $file)
+    $allAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue)
     foreach ($e in $entries) {
         try {
-            $null = Get-NetAdapter -InterfaceIndex $e.InterfaceIndex -ErrorAction Stop
-            Set-DnsClientServerAddress -InterfaceIndex $e.InterfaceIndex -ResetServerAddresses -ErrorAction Stop
-            if ($e.StaticServers -and @($e.StaticServers).Count -gt 0) {
-                Set-DnsClientServerAddress -InterfaceIndex $e.InterfaceIndex -ServerAddresses @($e.StaticServers) -ErrorAction Stop
-                Write-Log ('  DNS on {0} restored to {1}' -f $e.Name, (@($e.StaticServers) -join ', ')) Debug
+            # Find the adapter by its GUID first: the interface index can change after a driver update.
+            $index = $null
+            if ($e.Guid) { $index = $allAdapters | Where-Object { $_.InterfaceGuid -eq $e.Guid } | Select-Object -First 1 -ExpandProperty InterfaceIndex }
+            if ($null -eq $index) { $index = (Get-NetAdapter -InterfaceIndex $e.InterfaceIndex -ErrorAction Stop).InterfaceIndex }
+            $servers = @($e.StaticServers | Where-Object { $_ })
+            Set-DnsClientServerAddress -InterfaceIndex $index -ResetServerAddresses -ErrorAction Stop
+            if ($servers.Count -gt 0) {
+                Set-DnsClientServerAddress -InterfaceIndex $index -ServerAddresses $servers -ErrorAction Stop
+                Write-Log ('  DNS on {0} restored to {1}' -f $e.Name, ($servers -join ', ')) Debug
             } else {
                 Write-Log ('  DNS on {0} restored to automatic (DHCP)' -f $e.Name) Debug
             }
-        } catch { Write-Log ('  could not restore DNS on interface {0}: {1}' -f $e.InterfaceIndex, $_.Exception.Message) Warn }
+        } catch { Write-Log ('  could not restore DNS on {0} (interface {1}): {2}' -f $e.Name, $e.InterfaceIndex, $_.Exception.Message) Warn }
     }
     Move-Item -LiteralPath $file -Destination ($file + '.restored_' + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force
     Clear-DnsClientCache
@@ -1118,8 +1182,7 @@ function Task-0patch {
 }
 
 function Task-mbam {
-    $exe = Join-Path $env:ProgramFiles 'Malwarebytes\Anti-Malware\mbam.exe'
-    if (Test-Path -LiteralPath $exe) { Write-Log 'Malwarebytes is already installed.' Success; return }
+    if (Test-MalwarebytesInstalled) { Write-Log 'Malwarebytes is already installed.' Success; return }
     if (-not (Install-WithWinget -Id 'Malwarebytes.Malwarebytes' -Name 'Malwarebytes')) {
         $setup = Get-Download -Url 'https://downloads.malwarebytes.com/file/mb-windows' -FileName 'MBSetup.exe' -Signer 'Malwarebytes'
         Start-Installer -Path $setup -Arguments @('/VERYSILENT', '/NORESTART')
@@ -1158,10 +1221,11 @@ function Task-firefox {
     if (-not (Install-WithWinget -Id 'Mozilla.Firefox' -Name 'Mozilla Firefox')) {
         $culture = (Get-UICulture).Name
         $langs = @($culture.Split('-')[0], $culture, 'en-US') | Select-Object -Unique
+        $os = if ([Environment]::Is64BitOperatingSystem) { 'win64' } else { 'win' }   # 'win' = the 32-bit build
         $setup = $null
         foreach ($lang in $langs) {
             try {
-                $setup = Get-Download -Url "https://download.mozilla.org/?product=firefox-latest-ssl&os=win64&lang=$lang" -FileName 'FirefoxSetup.exe' -Signer 'Mozilla'
+                $setup = Get-Download -Url "https://download.mozilla.org/?product=firefox-latest-ssl&os=$os&lang=$lang" -FileName 'FirefoxSetup.exe' -Signer 'Mozilla'
                 Write-Log "  Firefox language: $lang" Debug
                 break
             } catch { Write-Log "  no installer for language '$lang' ($($_.Exception.Message))" Debug }
@@ -1207,8 +1271,16 @@ function Task-revert {
     # 1. Registry values
     $file = Get-RegBackupPath
     if (Test-Path -LiteralPath $file) {
-        $list = @((Get-Content -LiteralPath $file -Raw) | ConvertFrom-Json)
+        $list = @(Read-JsonArray $file)
+        $seen = @{}
+        $count = 0
         foreach ($e in $list) {
+            if (-not $e.Path -or -not $e.Name) { continue }
+            # The first entry for a value holds the state from before the tool touched it.
+            $id = ('{0}|{1}' -f $e.Path, $e.Name).ToLower()
+            if ($seen.ContainsKey($id)) { continue }
+            $seen[$id] = $true
+            $count++
             try {
                 if ($e.Existed) {
                     if (-not (Test-Path -LiteralPath $e.Path)) { New-Item -Path $e.Path -Force | Out-Null }
@@ -1224,30 +1296,43 @@ function Task-revert {
             } catch { Write-Log ('  could not restore {0}\{1}: {2}' -f $e.Path, $e.Name, $_.Exception.Message) Warn }
         }
         Move-Item -LiteralPath $file -Destination ($file + '.restored_' + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force
-        Write-Log "  $($list.Count) registry value(s) restored." Success
+        Write-Log "  $count registry value(s) restored." Success
     } else {
         Write-Log '  no registry backup found - nothing to restore.'
     }
 
     # 2. Defender ASR rules and Controlled Folder Access
     try {
-        $pref = Get-MpPreference -ErrorAction Stop
-        $current = @($pref.AttackSurfaceReductionRules_Ids)
-        if ($current.Count -gt 0) { Remove-MpPreference -AttackSurfaceReductionRules_Ids $current -ErrorAction Stop }
+        # The ASR rules are only touched when the ASR task saved a backup, i.e. when this tool changed them.
         $asrFile = Join-Path $sync.StateDir 'asr-backup.json'
         if (Test-Path -LiteralPath $asrFile) {
-            $b = (Get-Content -LiteralPath $asrFile -Raw) | ConvertFrom-Json
-            if ($b.Ids -and @($b.Ids).Count -gt 0) {
-                Add-MpPreference -AttackSurfaceReductionRules_Ids @($b.Ids) -AttackSurfaceReductionRules_Actions @($b.Actions | ForEach-Object { [int]$_ }) -ErrorAction Stop
-                Write-Log ('  previous ASR configuration restored ({0} rules)' -f @($b.Ids).Count) Debug
+            $pref = Get-MpPreference -ErrorAction Stop
+            $current = @($pref.AttackSurfaceReductionRules_Ids | Where-Object { $_ })
+            if ($current.Count -gt 0) { Remove-MpPreference -AttackSurfaceReductionRules_Ids $current -ErrorAction Stop }
+            $b = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $asrFile -Raw)
+            $savedIds = @($b.Ids); $savedActions = @($b.Actions)
+            $oldIds = @(); $oldActions = @()
+            for ($i = 0; $i -lt $savedIds.Count; $i++) {
+                if (-not $savedIds[$i]) { continue }
+                $oldIds += [string]$savedIds[$i]
+                $oldActions += $(if ($i -lt $savedActions.Count) { [int]$savedActions[$i] } else { 0 })
+            }
+            if ($oldIds.Count -gt 0) {
+                Add-MpPreference -AttackSurfaceReductionRules_Ids $oldIds -AttackSurfaceReductionRules_Actions $oldActions -ErrorAction Stop
+                Write-Log ('  previous ASR configuration restored ({0} rules)' -f $oldIds.Count) Debug
             } else {
                 Write-Log '  ASR rules removed (none were configured before)' Debug
             }
             Move-Item -LiteralPath $asrFile -Destination ($asrFile + '.restored_' + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force
+            Write-Log '  ASR rules reverted.' Success
+        } else {
+            Write-Log '  no ASR backup found - ASR rules left as they are.'
         }
-        Set-MpPreference -EnableControlledFolderAccess Disabled -ErrorAction SilentlyContinue
-        Write-Log '  ASR rules reverted; Controlled Folder Access off.' Success
-    } catch { Write-Log "  Defender revert: $($_.Exception.Message)" Warn }
+    } catch { Write-Log "  ASR revert: $($_.Exception.Message)" Warn }
+    try {
+        Set-MpPreference -EnableControlledFolderAccess Disabled -ErrorAction Stop
+        Write-Log '  Controlled Folder Access off.' Success
+    } catch { Write-Log "  Controlled Folder Access: $($_.Exception.Message)" Warn }
 
     # 3. NetBIOS back to default (only if the network task ran)
     $marker = Join-Path $sync.StateDir 'network-applied'
@@ -1255,9 +1340,17 @@ function Task-revert {
         foreach ($nic in @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE')) {
             try { Invoke-CimMethod -InputObject $nic -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = [uint32]0 } -ErrorAction Stop | Out-Null } catch { }
         }
-        try { Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction Stop } catch { }
+        # Re-open the Remote Desktop firewall rules only if RDP itself is allowed again (the registry value was
+        # restored in step 1). If RDP was off before the tool ran, its rules were closed too and stay closed.
+        $rdpDenied = 1
+        try { $rdpDenied = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections } catch { $rdpDenied = 1 }
+        $rdpText = 'Remote Desktop is off, its firewall rules stay disabled'
+        if ($rdpDenied -eq 0) {
+            $rdpText = 'Remote Desktop firewall rules re-enabled'
+            try { Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction Stop } catch { $rdpText = "Remote Desktop firewall rules could not be re-enabled ($($_.Exception.Message))" }
+        }
         Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
-        Write-Log '  NetBIOS set back to default; Remote Desktop firewall rules re-enabled (RDP itself follows the restored registry value).' Success
+        Write-Log "  NetBIOS set back to default; $rdpText." Success
     }
 
     # 4. DNS
@@ -1502,7 +1595,10 @@ function Complete-Worker {
     Drain-Queues
     try { $w.PS.Dispose(); $w.Runspace.Dispose() } catch { }
     switch ($w.Kind) {
-        'status' { if ($sync.StatusResult) { Fill-StatusList $sync.StatusResult } }
+        'status' {
+            if ($sync.StatusResult) { Fill-StatusList $sync.StatusResult }
+            else { $ui.StatusInfo.Text = 'The system status could not be collected - see the activity log.' }
+        }
         'run'    { Show-RunSummary -Kind 'run' }
         'revert' { Show-RunSummary -Kind 'revert' }
     }
@@ -1523,6 +1619,7 @@ function Reset-RunState {
 function Start-StatusRefresh {
     if ($script:Worker) { return }
     $ui.StatusInfo.Text = 'Collecting system status ...'
+    $sync.StatusResult = $null   # so a failed refresh is not shown as fresh data from the previous one
     Set-UiBusy $true
     Start-Worker -Kind 'status' -Script { $sync.StatusResult = Get-SystemStatus }
 }
@@ -1537,6 +1634,14 @@ $form = New-Control Form @{
     AutoScaleMode = 'Dpi'
 }
 try { $form.Icon = [System.Drawing.SystemIcons]::Shield } catch { }
+# Never open larger than the screen: on a 1366x768 display the default height would push the button bar
+# off-screen / under the taskbar.
+try {
+    $workArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $minSize = $form.MinimumSize
+    $form.MinimumSize = New-Object System.Drawing.Size([Math]::Min($minSize.Width, $workArea.Width), [Math]::Min($minSize.Height, $workArea.Height))
+    $form.Size = New-Object System.Drawing.Size([Math]::Min($form.Width, $workArea.Width), [Math]::Min($form.Height, $workArea.Height))
+} catch { }
 $ui.Form = $form
 $ui.LogFont = New-Object System.Drawing.Font('Consolas', 9)
 $ui.LogBold = New-Object System.Drawing.Font('Consolas', 9, [System.Drawing.FontStyle]::Bold)
@@ -1600,7 +1705,9 @@ $groups = @{}
 foreach ($t in $TaskDefs) {
     if ($t.Hidden) { continue }
     if (-not $groups.ContainsKey($t.Group)) {
-        $g = New-Object System.Windows.Forms.ListViewGroup($t.Group, 'Left')
+        # The enum must be explicit: with two strings PowerShell picks the (key, headerText) constructor
+        # and every group header would read "Left".
+        $g = New-Object System.Windows.Forms.ListViewGroup($t.Group, [System.Windows.Forms.HorizontalAlignment]::Left)
         $groups[$t.Group] = $g
         [void]$lv.Groups.Add($g)
     }
@@ -1741,7 +1848,10 @@ $form.add_Shown({
 })
 
 $form.add_FormClosing({
-    if ($script:Worker) {
+    if ($script:Worker -and $script:Worker.Kind -eq 'status') {
+        # Only the read-only status collection is running: nothing can be left half-finished, so do not ask.
+        try { [void]$script:Worker.PS.BeginStop($null, $null) } catch { }
+    } elseif ($script:Worker) {
         $r = [System.Windows.Forms.MessageBox]::Show($ui.Form, 'A task is still running. Closing now may leave an installer or update half-finished. Close anyway?', 'Task running', 'YesNo', 'Warning', 'Button2')
         if ($r -ne 'Yes') { $_.Cancel = $true; return }
         $sync.Cancel = $true

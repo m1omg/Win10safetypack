@@ -138,13 +138,41 @@ Default = ticked when the window opens. Everything is explained again inside the
 * Some hardening can interfere with legitimate software: ASR rules (check *Protection history* in Windows
   Security and add exclusions), LSA Protection (very old smart-card/authentication plug-ins), NetBIOS/LLMNR
   (old NAS/printers by name), Controlled Folder Access (unknown apps saving to Documents). Everything in
-  that list is undone by **Revert hardening**.
+  that list is undone by **Revert hardening**, with one caveat: on a PC with UEFI Secure Boot, Windows may
+  also store the LSA Protection setting in a firmware variable. Revert restores the registry value, but LSA
+  Protection can then stay on until that variable is cleared with Microsoft's
+  [LSA Protected Process Opt-out tool](https://www.microsoft.com/download/details.aspx?id=40897).
+* **Revert hardening** only undoes what the tool itself changed: the ASR rules are put back only if the ASR
+  task was run (it never touches rules you configured yourself otherwise), and the Remote Desktop firewall
+  rules are re-enabled only if Remote Desktop was switched on before the *Network hardening* task ran.
 * The ESU enrolment detection reads a registry key that is community-documented, not officially documented;
   treat "not enrolled" as "check Settings", not as gospel.
 * The SmartScreen, Edge and LLMNR settings are written as *policies* (the same keys Group Policy uses), so
   Windows Security and Edge will show "Some settings are managed by your organization" for those items.
   That is cosmetic. If the ESU enrolment wizard ever refuses with a similar message, run **Revert hardening**
   (which removes those policy values), enrol, then run the hardening again.
+
+## Changelog
+
+**1.0.1** - bug fixes, no change to what the tasks do:
+
+* *Revert hardening* could not read its own backups on Windows PowerShell 5.1 (a JSON array comes back as
+  one object there), so registry values and, with more than one network adapter, DNS servers were not
+  restored correctly, and the registry backup file itself was damaged by each new entry. Backups are now
+  read and written correctly; files written by 1.0.0 are still read as far as they are intact.
+* *Revert hardening* no longer removes Attack Surface Reduction rules when the ASR task was never run, and
+  no longer enables the Remote Desktop firewall rules on a PC where Remote Desktop was off before.
+* The task list showed "Left" as the header of every group.
+* The window no longer opens taller than a 1366x768 screen (the button bar was off-screen).
+* *System status*: no failure of the Defender rows when there are no definitions, the ASR row no longer
+  counts one rule when none is configured, Malwarebytes is detected whatever its executable is called,
+  and a failed refresh is no longer shown as fresh data.
+* Quad9 DNS: an adapter that was offline during an earlier run is now added to the backup; DNS is restored
+  by adapter GUID, so a changed interface index no longer matters.
+* Firefox: the vendor-download fallback fetched the 64-bit installer on 32-bit Windows.
+* SMBv1/PowerShell 2.0 task: an optional feature that the Windows build does not have is skipped whichever
+  way DISM reports it.
+* Closing the window while only the status check is running no longer warns about a half-finished installer.
 
 ## License
 
