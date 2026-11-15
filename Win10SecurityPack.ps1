@@ -32,11 +32,18 @@
     .\Win10SecurityPack.ps1
     Opens the GUI (asks for administrator rights).
 
+.PARAMETER Elevated
+    Internal: set by the tool itself when it restarts with administrator rights in command-line mode.
+
 .EXAMPLE
     .\Win10SecurityPack.ps1 -Tasks restore,defender,asr,firewall,legacy,harden
     Runs the given tasks without a GUI and prints the log to the console.
 
 .NOTES
+    Exit codes in command-line mode: 0 = all tasks succeeded, 1 = at least one task failed or only partly
+    succeeded, 2 = unknown task id, 3 = the state folder could not be secured, 1223 = administrator rights
+    were refused (UAC prompt declined).
+
     Requires Windows 10 (22H2 recommended), Windows PowerShell 5.1 and administrator rights.
     Tested approach: Windows Forms GUI + background runspace so the window stays responsive.
 
@@ -46,11 +53,12 @@
 [CmdletBinding()]
 param(
     [string[]]$Tasks,
-    [switch]$ListTasks
+    [switch]$ListTasks,
+    [switch]$Elevated
 )
 
 $ErrorActionPreference = 'Continue'
-$script:ToolVersion = '1.0.1'
+$script:ToolVersion = '1.1.0'
 
 # ===========================================================================================
 #  Task catalogue (data only - the implementation is in the Task-<Id> functions below)
@@ -280,9 +288,12 @@ lists any threats detected. Usually takes 5-15 minutes. For a full scan use Wind
         Id = 'revert'; Group = 'Maintenance'; Name = 'Revert hardening changes made by this tool'
         Recommended = $false; Hidden = $true
         Description = @'
-Restores the registry values, ASR rules, DNS servers and NetBIOS settings this tool changed, from the
-backups it kept in C:\ProgramData\Win10SecurityPack, and turns Controlled Folder Access off.
-Defender settings, the firewall, SMBv1/PowerShell 2.0 removal and installed programs are left alone.
+Restores what this tool changed - registry values, the ASR rules it set, Controlled Folder Access,
+DNS servers, NetBIOS and the Remote Desktop firewall rules - to the state saved in its backups in
+C:\ProgramData\Win10SecurityPack. Anything that cannot be restored now (for example an adapter that is
+unplugged, or the account a per-user setting belongs to is not signed in) stays in the backup for the
+next revert. Defender settings, the firewall, SMBv1/PowerShell 2.0 removal and installed programs are
+left alone.
 '@
     }
 )
@@ -302,6 +313,13 @@ if ($ListTasks) {
 # Normalise -Tasks (when launched through powershell.exe -File the value arrives as one "a,b,c" string)
 if ($Tasks) {
     $Tasks = @($Tasks | ForEach-Object { $_ -split '[,; ]+' } | Where-Object { $_ } | ForEach-Object { $_.Trim().ToLower() })
+    # Checked before elevating, so a caller without administrator rights gets exit code 2 directly.
+    $known = @($TaskDefs | ForEach-Object { $_.Id })
+    $invalid = @($Tasks | Where-Object { $known -notcontains $_ })
+    if ($invalid.Count -gt 0) {
+        Write-Host ("Unknown task id(s): {0}. Use -ListTasks to see the available ids." -f ($invalid -join ', ')) -ForegroundColor Red
+        exit 2
+    }
 }
 
 # ===========================================================================================
@@ -315,18 +333,26 @@ function Test-IsAdmin {
 
 if (-not (Test-IsAdmin)) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass')
-    if ($Tasks) { $argList += '-NoExit' } else { $argList += @('-WindowStyle', 'Hidden') }
+    if (-not $Tasks) { $argList += @('-WindowStyle', 'Hidden') }
     $argList += @('-File', ('"{0}"' -f $PSCommandPath))
-    if ($Tasks) { $argList += @('-Tasks', ($Tasks -join ',')) }
+    if ($Tasks) { $argList += @('-Tasks', ($Tasks -join ','), '-Elevated') }
+    $child = $null
     try {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -ErrorAction Stop | Out-Null
+        $child = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -Verb RunAs -PassThru -ErrorAction Stop
     } catch {
         Write-Host ''
         Write-Host 'This tool needs administrator rights (the UAC prompt was declined or failed).' -ForegroundColor Yellow
         Write-Host $_.Exception.Message -ForegroundColor DarkGray
-        Read-Host 'Press Enter to close' | Out-Null
+        if (-not $Tasks) { Read-Host 'Press Enter to close' | Out-Null }
+        exit 1223   # ERROR_CANCELLED
     }
-    exit
+    if ($Tasks) {
+        # Command-line mode: wait for the elevated run and pass its exit code on to the caller.
+        $null = $child.Handle   # keeps the process handle open, so ExitCode can be read after the wait
+        $child.WaitForExit()
+        exit $child.ExitCode
+    }
+    exit 0
 }
 
 # ===========================================================================================
@@ -336,9 +362,135 @@ try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 } catch { }
 
+function Stop-Fatal {
+    # Startup failure before logging is set up: tell the user and stop.
+    param([string]$Message)
+    Write-Host ''
+    Write-Host $Message -ForegroundColor Red
+    if (-not $Tasks) {
+        # GUI mode runs in a hidden console window, so the message has to be a dialog.
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            [void][System.Windows.Forms.MessageBox]::Show($Message, 'Windows 10 Security Pack', 'OK', 'Error')
+        } catch { }
+    } elseif ($Elevated) {
+        Read-Host 'Press Enter to close' | Out-Null
+    }
+    exit 3
+}
+
+# ---- state folder: only administrators may write to it ------------------------------------
+# The backups in this folder are read by an elevated process and decide which registry values, DNS servers
+# and Defender rules get written, so nothing in it may come from a less privileged account. Standard users
+# can create folders and files in C:\ProgramData, so the folder may have been created or filled by one.
+$StartupWarnings = New-Object System.Collections.ArrayList
+$CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$TrustedSids = @(
+    'S-1-5-18',       # SYSTEM
+    'S-1-5-32-544',   # Administrators
+    'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464',   # TrustedInstaller
+    $CurrentUserSid
+)
+$script:AdminMemberSids = $null
+
+function Test-TrustedSid {
+    param([string]$Sid)
+    if ($TrustedSids -contains $Sid) { return $true }
+    # Another administrator account (files written when a different admin ran the tool are owned by it).
+    if ($null -eq $script:AdminMemberSids) {
+        $script:AdminMemberSids = @()
+        try { $script:AdminMemberSids = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop | ForEach-Object { $_.SID.Value }) } catch { }
+    }
+    return ($script:AdminMemberSids -contains $Sid)
+}
+
+function Test-StateItemTrusted {
+    # $CheckAcl: also reject explicit (not inherited) ACEs that let an untrusted account write. Inherited ACEs
+    # come from the state folder, whose permissions are replaced below.
+    param([IO.FileSystemInfo]$Item, [switch]$CheckAcl)
+    if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }   # the tool never creates links
+    $acl = $null
+    try { $acl = $Item.GetAccessControl() } catch { return $false }   # permissions unreadable for administrators
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+    if (-not $owner -or -not (Test-TrustedSid $owner.Value)) { return $false }
+    if ($CheckAcl) {
+        # write data, append, write attributes, delete, change permissions, take ownership, GENERIC_WRITE/ALL
+        $writeMask = 0x500D0156
+        foreach ($rule in $acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+            $sid = $rule.IdentityReference.Value
+            if ($sid -eq 'S-1-3-0' -or (Test-TrustedSid $sid)) { continue }   # S-1-3-0 = CREATOR OWNER template
+            if (([int64]$rule.FileSystemRights -band $writeMask) -ne 0) { return $false }
+        }
+    }
+    return $true
+}
+
+function Get-UntrustedStateItems {
+    param([IO.DirectoryInfo]$Dir)
+    foreach ($child in $Dir.GetFileSystemInfos()) {
+        if ($child.Name -match '\.untrusted_\d{8}_\d{6}$') { continue }   # already set aside earlier, never read
+        if (-not (Test-StateItemTrusted -Item $child -CheckAcl)) { $child; continue }
+        if ($child -is [IO.DirectoryInfo]) { Get-UntrustedStateItems -Dir $child }
+    }
+}
+
+function Move-Aside {
+    # Renames a file, folder or link (a link is renamed itself; its target is not touched).
+    param([string]$Path, [string]$Destination)
+    if (([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::Directory) -ne 0) { [IO.Directory]::Move($Path, $Destination) }
+    else { [IO.File]::Move($Path, $Destination) }
+}
+
+function Protect-StateDir {
+    param([string]$Path)
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    # GetAttributes looks at the name itself, so a link whose target is missing is found too (Test-Path
+    # follows links and would report it as absent).
+    $attributes = $null
+    try { $attributes = [IO.File]::GetAttributes($Path) }
+    catch {
+        if ([IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path)) { throw }   # exists, but unreadable
+        $attributes = $null                                                        # does not exist yet
+    }
+    if ($null -ne $attributes) {
+        $isPlainDir = (($attributes -band [IO.FileAttributes]::Directory) -ne 0) -and (($attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+        if (-not $isPlainDir -or -not (Test-StateItemTrusted -Item (New-Object IO.DirectoryInfo($Path)))) {
+            # Created by another account, or a link to somewhere else: set the whole thing aside, unused.
+            $aside = "$Path.untrusted_$stamp"
+            Move-Aside -Path $Path -Destination $aside
+            [void]$StartupWarnings.Add("$Path was not created by an administrator. It was renamed to $aside and is not used; earlier backups in it are ignored.")
+        } else {
+            foreach ($item in @(Get-UntrustedStateItems -Dir (New-Object IO.DirectoryInfo($Path)))) {
+                $aside = "$($item.FullName).untrusted_$stamp"
+                Move-Aside -Path $item.FullName -Destination $aside
+                [void]$StartupWarnings.Add("$($item.FullName) was created or can be changed by a non-administrator account. It was renamed to $aside and is not used.")
+            }
+        }
+    }
+    if (-not [IO.Directory]::Exists($Path)) { [void][IO.Directory]::CreateDirectory($Path) }
+    # SYSTEM and Administrators: full control; Users: read only. Not inherited from C:\ProgramData.
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    foreach ($grant in @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'), @('S-1-5-32-545', 'ReadAndExecute'))) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier($grant[0])),
+            [System.Security.AccessControl.FileSystemRights]$grant[1], $inherit,
+            [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+        $security.AddAccessRule($rule)
+    }
+    (Get-Item -LiteralPath $Path -Force).SetAccessControl($security)
+}
+
 $ScriptDir = Split-Path -Parent $PSCommandPath
 $StateDir  = Join-Path $env:ProgramData 'Win10SecurityPack'
-New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+try {
+    Protect-StateDir -Path $StateDir
+} catch {
+    Stop-Fatal ("The tool's state folder $StateDir could not be secured: $($_.Exception.Message)`r`n`r`n" +
+        'Nothing was changed. Delete or rename that folder as an administrator, then start the tool again.')
+}
 
 # Log next to the script if that location is writable, otherwise under ProgramData.
 $LogDir = Join-Path $ScriptDir 'logs'
@@ -352,8 +504,11 @@ try {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 }
 
-$DownloadDir = Join-Path $env:TEMP 'Win10SecurityPack'
-New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null
+# Installers are downloaded into the protected state folder, not %TEMP%: the user's own (non-elevated)
+# programs can write to %TEMP% and could swap a file between the signature check and its launch.
+$DownloadDir = Join-Path $StateDir 'downloads'
+try { New-Item -ItemType Directory -Path $DownloadDir -Force -ErrorAction Stop | Out-Null }
+catch { Stop-Fatal "The download folder $DownloadDir could not be created: $($_.Exception.Message)" }
 
 # Shared state between the GUI thread and the background worker runspace.
 $sync = [hashtable]::Synchronized(@{})
@@ -371,6 +526,10 @@ $sync.DownloadDir  = $DownloadDir
 $sync.Cli          = [bool]$Tasks
 $sync.TaskDefs     = $TaskDefs
 $sync.StatusResult = $null
+$sync.Problems     = New-Object System.Collections.ArrayList   # problems of the task that is running now
+$sync.LogLock      = New-Object object                         # GUI thread and worker both append to the log file
+$sync.LogFileError = $null
+$sync.UserSid      = $CurrentUserSid                           # whose hive HKCU: is in this elevated process
 
 # ===========================================================================================
 #  Shared functions - everything defined between the two markers is also injected into the
@@ -378,12 +537,34 @@ $sync.StatusResult = $null
 # ===========================================================================================
 $__fnBefore = @(Get-ChildItem Function: | Select-Object -ExpandProperty Name)
 
+function Write-LogFile {
+    # Writes one entry to the log file at once (not when the GUI gets round to showing it), so the file is
+    # complete even if the window hangs or crashes. A write failure is reported once, on screen.
+    param($Entry)
+    $line = '[{0:yyyy-MM-dd HH:mm:ss}] [{1,-7}] {2}' -f $Entry.Time, $Entry.Level.ToUpper(), $Entry.Message
+    $failure = $null
+    [System.Threading.Monitor]::Enter($sync.LogLock)
+    try {
+        [IO.File]::AppendAllText($sync.LogFile, $line + [Environment]::NewLine, [Text.Encoding]::UTF8)
+    } catch {
+        if (-not $sync.LogFileError) { $sync.LogFileError = $_.Exception.Message; $failure = $sync.LogFileError }
+    } finally {
+        [System.Threading.Monitor]::Exit($sync.LogLock)
+    }
+    if ($failure) {
+        $text = "The log file $($sync.LogFile) cannot be written ($failure). Messages may be missing from it - keep this window's output instead."
+        if ($sync.Cli) { Write-Host $text -ForegroundColor Red }
+        else { $sync.Log.Enqueue([pscustomobject]@{ Time = Get-Date; Level = 'Error'; Message = $text }) }
+    }
+}
+
 function Write-Log {
     param(
         [Parameter(Mandatory)][string]$Message,
         [ValidateSet('Info', 'Warn', 'Error', 'Success', 'Step', 'Debug')][string]$Level = 'Info'
     )
     $entry = [pscustomobject]@{ Time = Get-Date; Level = $Level; Message = $Message }
+    Write-LogFile $entry
     if ($sync.Cli) {
         $line = '[{0:HH:mm:ss}] [{1,-7}] {2}' -f $entry.Time, $Level.ToUpper(), $Message
         $color = switch ($Level) {
@@ -395,7 +576,6 @@ function Write-Log {
             default   { 'Gray' }
         }
         Write-Host $line -ForegroundColor $color
-        try { [IO.File]::AppendAllText($sync.LogFile, $line + [Environment]::NewLine, [Text.Encoding]::UTF8) } catch { }
     } else {
         $sync.Log.Enqueue($entry)
     }
@@ -410,6 +590,14 @@ function Set-TaskStatus {
 function Add-Advice {
     param([string]$Text)
     if (-not $sync.Advice.Contains($Text)) { [void]$sync.Advice.Add($Text) }
+}
+
+function Add-TaskProblem {
+    # Something in the running task did not work, but the rest of the task could go on. The task is then
+    # reported as "Partial" instead of "Done" (and the command line exits with 1).
+    param([string]$Text)
+    [void]$sync.Problems.Add($Text)
+    Write-Log "  $Text" Warn
 }
 
 # ---- JSON backup files --------------------------------------------------------------------
@@ -437,22 +625,103 @@ function Read-JsonArray {
     Expand-JsonNode $parsed
 }
 
+function Save-JsonArray {
+    param([Parameter(Mandatory)][string]$File, [object[]]$Items = @())
+    ConvertTo-Json -InputObject @($Items) -Depth 5 | Set-Content -LiteralPath $File -Encoding UTF8 -ErrorAction Stop
+}
+
+function Complete-BackupFile {
+    # The backup was used by a revert: archive it. Entries that could not be restored are written to a new
+    # active backup, so the next revert tries them again.
+    param([Parameter(Mandatory)][string]$File, [object[]]$Remaining = @(), $RemainingObject)
+    Move-Item -LiteralPath $File -Destination ($File + '.restored_' + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force -ErrorAction Stop
+    if ($null -ne $RemainingObject) {
+        ConvertTo-Json -InputObject $RemainingObject -Depth 5 | Set-Content -LiteralPath $File -Encoding UTF8 -ErrorAction Stop
+    } elseif (@($Remaining).Count -gt 0) {
+        Save-JsonArray -File $File -Items $Remaining
+    }
+}
+
+function Test-GuidText {
+    param([string]$Text)
+    return ($Text -match '^\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?$')
+}
+
+function Get-AccountName {
+    param([string]$Sid)
+    try { return (New-Object Security.Principal.SecurityIdentifier($Sid)).Translate([Security.Principal.NTAccount]).Value } catch { return $Sid }
+}
+
 # ---- registry with backup -----------------------------------------------------------------
 function Get-RegBackupPath { Join-Path $sync.StateDir 'registry-backup.json' }
 
+function Get-RegAllowlist {
+    # Every registry value this tool changes with a backup. Revert restores nothing else, whatever a backup
+    # file says. Per-user (HKCU) values are matched in any user's hive.
+    @(
+        'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer|NoDriveTypeAutoRun'
+        'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer|NoAutorun'
+        'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers|DisableAutoplay'
+        'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|HideFileExt'
+        'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|EnableLUA'
+        'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|ConsentPromptBehaviorAdmin'
+        'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|PromptOnSecureDesktop'
+        'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System|EnableInstallerDetection'
+        'HKLM\SOFTWARE\Policies\Microsoft\Windows\System|EnableSmartScreen'
+        'HKLM\SOFTWARE\Policies\Microsoft\Windows\System|ShellSmartScreenLevel'
+        'HKLM\SOFTWARE\Policies\Microsoft\Edge|SmartScreenEnabled'
+        'HKLM\SOFTWARE\Policies\Microsoft\Edge|SmartScreenPuaEnabled'
+        'HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest|UseLogonCredential'
+        'HKLM\SYSTEM\CurrentControlSet\Control\Lsa|RestrictAnonymousSAM'
+        'HKLM\SYSTEM\CurrentControlSet\Control\Lsa|NoLMHash'
+        'HKLM\SYSTEM\CurrentControlSet\Control\Lsa|RunAsPPL'
+        'HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient|EnableMulticast'
+        'HKLM\SYSTEM\CurrentControlSet\Control\Remote Assistance|fAllowToGetHelp'
+        'HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server|fDenyTSConnections'
+    ) | ForEach-Object { $_.ToLowerInvariant() }
+}
+
+function Resolve-RegPath {
+    # HKCU: in this elevated process is the hive of the account that approved the UAC prompt. Write that
+    # hive by its SID, so the backup says whose setting it is and Revert puts it back in the same account,
+    # whichever administrator runs it.
+    param([string]$Path)
+    if ($Path -match '^HKCU:\\') { return 'Registry::HKEY_USERS\' + $sync.UserSid + $Path.Substring(5) }
+    return $Path
+}
+
+function Format-RegPath {
+    param([string]$Path)
+    return (($Path -replace '^Registry::', '') -replace '^(HKLM|HKCU):', '$1')
+}
+
+function Test-RegAllowed {
+    param([string]$Path, [string]$Name)
+    $p = $Path -replace '^Registry::', ''
+    $p = $p -replace '^(HKLM:|HKEY_LOCAL_MACHINE)\\', 'HKLM\'
+    $p = $p -replace '^(HKCU:|HKEY_CURRENT_USER)\\', 'HKCU\'
+    $p = $p -replace '^HKEY_USERS\\S-1-[0-9]+(-[0-9]+)+\\', 'HKCU\'
+    return ((Get-RegAllowlist) -contains ('{0}|{1}' -f $p.TrimEnd('\'), $Name).ToLowerInvariant())
+}
+
+function Get-RegEntryId {
+    # Identity of a backed-up value; a 1.0.x "HKCU:" entry and an HKEY_USERS entry of the same account match.
+    param($Entry)
+    return ('{0}|{1}' -f (Resolve-RegPath ([string]$Entry.Path)), $Entry.Name).ToLowerInvariant()
+}
+
 function Add-RegBackupEntry {
     param([string]$Path, [string]$Name)
+    if (-not (Test-RegAllowed $Path $Name)) { throw "Internal error: $Path\$Name is missing from Get-RegAllowlist, so Revert could not restore it." }
     $file = Get-RegBackupPath
     $list = @()
     if (Test-Path -LiteralPath $file) {
+        # Never start a new backup over an unreadable one: it may hold the only record of the original values.
         try { $list = @(Read-JsonArray $file) }
-        catch {
-            # Unreadable backup: set it aside instead of overwriting it, then start a new one.
-            try { Move-Item -LiteralPath $file -Destination ($file + '.unreadable_' + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force } catch { }
-            $list = @()
-        }
+        catch { throw "The registry backup $file cannot be read ($($_.Exception.Message)). Nothing was changed. Move the file somewhere else (or repair it) and run the task again." }
     }
-    foreach ($e in $list) { if ($e.Path -eq $Path -and $e.Name -eq $Name) { return } }
+    $id = ('{0}|{1}' -f $Path, $Name).ToLowerInvariant()
+    foreach ($e in $list) { if ((Get-RegEntryId $e) -eq $id) { return } }   # keep the oldest (original) value
 
     $existed = $false; $value = $null; $kind = $null
     if (Test-Path -LiteralPath $Path) {
@@ -467,7 +736,7 @@ function Add-RegBackupEntry {
         Path = $Path; Name = $Name; Existed = $existed; Value = $value; Kind = $kind
         Saved = (Get-Date).ToString('s')
     }
-    ConvertTo-Json -InputObject @($list) -Depth 5 | Set-Content -LiteralPath $file -Encoding UTF8
+    Save-JsonArray -File $file -Items $list
 }
 
 function Set-RegValue {
@@ -478,28 +747,62 @@ function Set-RegValue {
         [ValidateSet('DWord', 'QWord', 'String', 'ExpandString')][string]$Type = 'DWord',
         [switch]$NoBackup
     )
+    $Path = Resolve-RegPath $Path
     if (-not $NoBackup) { Add-RegBackupEntry -Path $Path -Name $Name }
     if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
     $old = $null
     try { $old = (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { $old = $null }
     New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
     $oldText = if ($null -eq $old) { '(not set)' } else { "$old" }
-    Write-Log ('  {0}\{1}: {2} -> {3}' -f ($Path -replace ':', ''), $Name, $oldText, $Value) Debug
+    Write-Log ('  {0}\{1}: {2} -> {3}' -f (Format-RegPath $Path), $Name, $oldText, $Value) Debug
 }
 
 # ---- downloads, signatures, installers ----------------------------------------------------
+function Get-SignerKey {
+    # "ACROS racunalniski inzeniring d.o.o." (written with accents in the certificate) ->
+    # "acrosracunalniskiinzeniringdoo": letters and digits only, accents removed, lower case - punctuation
+    # and accents do not matter, but the whole name must match.
+    param([string]$Name)
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $Name.Normalize([Text.NormalizationForm]::FormD).ToCharArray()) {
+        if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -eq [Globalization.UnicodeCategory]::NonSpacingMark) { continue }
+        if ([char]::IsLetterOrDigit($ch)) { [void]$sb.Append([char]::ToLowerInvariant($ch)) }
+    }
+    return $sb.ToString()
+}
+
+function Get-ExpectedSigners {
+    # The exact publisher names accepted for each vendor (see Get-SignerKey for the form).
+    param([string]$Vendor)
+    switch ($Vendor) {
+        'Microsoft'    { @('microsoftcorporation') }
+        'Mozilla'      { @('mozillacorporation') }
+        'Malwarebytes' { @('malwarebytesinc', 'malwarebytescorporation') }
+        'ACROS'        { @('acrosracunalniskiinzeniringdoo', 'acrosdoo') }   # 0patch
+        default        { @() }
+    }
+}
+
 function Test-FileSignature {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Signer)
     $leaf = Split-Path -Leaf $Path
-    $sig = Get-AuthenticodeSignature -FilePath $Path
+    $expected = @(Get-ExpectedSigners $Signer)
+    if ($expected.Count -eq 0) { throw "Internal error: no publisher names are defined for '$Signer'." }
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
     if ($sig.Status -ne 'Valid') {
         Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
         throw "Digital signature check FAILED for $leaf (status: $($sig.Status)). The file was deleted and NOT installed."
     }
-    $subject = $sig.SignerCertificate.Subject
-    if ($subject -notmatch [regex]::Escape($Signer)) {
+    # The publisher's name (certificate CN or O) must BE the vendor's name, not merely contain it:
+    # "CN=Not Microsoft Ltd" would pass a substring test.
+    $cert = $sig.SignerCertificate
+    $subject = $cert.Subject
+    $names = @($cert.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false))
+    if ($subject -match '(?:^|,\s*)O=("(?:[^"]|"")*"|[^,]+)') { $names += $Matches[1].Trim().Trim('"') }
+    $match = @($names | Where-Object { $_ } | Where-Object { $expected -contains (Get-SignerKey $_) })
+    if ($match.Count -eq 0) {
         Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-        throw "Unexpected signer for ${leaf}: '$subject' (expected a certificate containing '$Signer'). File deleted."
+        throw "Unexpected publisher for ${leaf}: '$subject' (expected $Signer). The file was deleted and NOT installed."
     }
     Write-Log "  signature OK: $subject" Debug
 }
@@ -712,9 +1015,10 @@ function Get-SystemStatus {
 
     # Firewall
     try {
-        $profiles = @(Get-NetFirewallProfile -ErrorAction Stop)
-        $off = @($profiles | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
-        Add-StatusItem 'Windows Firewall' $(if ($off.Count -eq 0) { 'enabled on all profiles' } else { 'DISABLED on: ' + ($off -join ', ') }) $(if ($off.Count -eq 0) { 'ok' } else { 'bad' })
+        # ActiveStore = the policy in effect (local settings combined with Group Policy), not just the local settings.
+        $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
+        $off = @($profiles | Where-Object { "$($_.Enabled)" -ne 'True' } | ForEach-Object { $_.Name })
+        Add-StatusItem 'Windows Firewall' $(if ($off.Count -eq 0) { 'enabled on all profiles (policy in effect)' } else { 'DISABLED in the policy in effect on: ' + ($off -join ', ') + ' (a third-party firewall, if installed, replaces it)' }) $(if ($off.Count -eq 0) { 'ok' } else { 'bad' })
     } catch { Add-StatusItem 'Windows Firewall' "Could not query: $($_.Exception.Message)" 'warn' }
 
     # SMBv1
@@ -745,7 +1049,13 @@ function Get-SystemStatus {
     # Tools
     $zp = Get-Service -Name '0patchService' -ErrorAction SilentlyContinue
     if (-not $zp) { $zp = Get-Service | Where-Object { $_.DisplayName -like '*0patch*' } | Select-Object -First 1 }
-    Add-StatusItem '0patch Agent' $(if ($zp) { 'installed (service {0}: {1})' -f $zp.Name, $zp.Status } else { 'not installed' }) $(if ($zp) { 'ok' } else { 'info' })
+    if (-not $zp) {
+        Add-StatusItem '0patch Agent' 'not installed' 'info'
+    } elseif ("$($zp.Status)" -eq 'Running') {
+        Add-StatusItem '0patch Agent' ('installed (service {0}: running)' -f $zp.Name) 'ok'
+    } else {
+        Add-StatusItem '0patch Agent' ('installed, but the service {0} is {1} - no micropatches are applied. Start it in services.msc or reinstall the agent.' -f $zp.Name, $zp.Status) 'bad'
+    }
 
     $mb = Test-MalwarebytesInstalled
     Add-StatusItem 'Malwarebytes' $(if ($mb) { 'installed' } else { 'not installed' }) $(if ($mb) { 'ok' } else { 'info' })
@@ -799,14 +1109,24 @@ function Task-restore {
 }
 
 function Set-MpPrefSafe {
+    # Returns $true when the setting was accepted; a failure is recorded as a task problem.
     param([string]$Name, $Value)
     try {
         $p = @{ $Name = $Value }
         Set-MpPreference @p -ErrorAction Stop
         Write-Log "  $Name = $Value" Debug
+        return $true
     } catch {
-        Write-Log "  could not set $Name = ${Value}: $($_.Exception.Message)" Warn
+        Add-TaskProblem "Could not set $Name = ${Value}: $($_.Exception.Message)"
+        return $false
     }
+}
+
+function Test-MpValue {
+    param($Actual, $Expected)
+    if ($null -eq $Actual) { return $false }
+    if ($Expected -is [bool]) { return ([bool]$Actual -eq $Expected) }
+    return ([int64]$Actual -eq [int64]$Expected)
 }
 
 function Task-defender {
@@ -814,7 +1134,7 @@ function Task-defender {
     if (-not $svc) { throw 'The Microsoft Defender Antivirus service (WinDefend) is not present. Is Defender removed or replaced by another product?' }
     if ($svc.Status -ne 'Running') {
         try { Start-Service -Name WinDefend -ErrorAction Stop; Write-Log '  Defender service started.' }
-        catch { Write-Log "  could not start the Defender service: $($_.Exception.Message)" Warn }
+        catch { Add-TaskProblem "Could not start the Defender service: $($_.Exception.Message)" }
     }
     $status = $null
     try { $status = Get-MpComputerStatus -ErrorAction Stop } catch { throw "Defender is not responding: $($_.Exception.Message)" }
@@ -824,21 +1144,38 @@ function Task-defender {
     }
 
     Write-Log '  applying protection settings ...'
-    Set-MpPrefSafe DisableRealtimeMonitoring $false
-    Set-MpPrefSafe DisableBehaviorMonitoring $false
-    Set-MpPrefSafe DisableIOAVProtection $false
-    Set-MpPrefSafe DisableScriptScanning $false
-    Set-MpPrefSafe DisableArchiveScanning $false
-    Set-MpPrefSafe DisableRemovableDriveScanning $false
-    Set-MpPrefSafe DisableBlockAtFirstSeen $false
-    Set-MpPrefSafe MAPSReporting 2            # Advanced
-    Set-MpPrefSafe SubmitSamplesConsent 1     # Send safe samples
-    Set-MpPrefSafe CloudBlockLevel 2          # High
-    Set-MpPrefSafe CloudExtendedTimeout 50
-    Set-MpPrefSafe PUAProtection 1            # Enabled
-    Set-MpPrefSafe EnableNetworkProtection 1  # Enabled
-    Set-MpPrefSafe CheckForSignaturesBeforeRunningScan $true
-    Set-MpPrefSafe SignatureUpdateInterval 4
+    $settings = [ordered]@{
+        DisableRealtimeMonitoring           = $false
+        DisableBehaviorMonitoring           = $false
+        DisableIOAVProtection               = $false
+        DisableScriptScanning               = $false
+        DisableArchiveScanning              = $false
+        DisableRemovableDriveScanning       = $false
+        DisableBlockAtFirstSeen             = $false
+        MAPSReporting                       = 2      # Advanced
+        SubmitSamplesConsent                = 1      # Send safe samples
+        CloudBlockLevel                     = 2      # High
+        CloudExtendedTimeout                = 50
+        PUAProtection                       = 1      # Enabled
+        EnableNetworkProtection             = 1      # Enabled
+        CheckForSignaturesBeforeRunningScan = $true
+        SignatureUpdateInterval             = 4
+    }
+    $applied = New-Object System.Collections.ArrayList
+    foreach ($name in $settings.Keys) {
+        if (Set-MpPrefSafe $name $settings[$name]) { [void]$applied.Add($name) }
+    }
+    if ($applied.Count -eq 0) { throw 'Defender accepted none of the protection settings (see the warnings above).' }
+
+    # Read the settings back: a Group Policy or Tamper Protection can make Defender ignore an accepted change.
+    try {
+        $now = Get-MpPreference -ErrorAction Stop
+        foreach ($name in $applied) {
+            if (-not (Test-MpValue $now.$name $settings[$name])) {
+                Add-TaskProblem ("{0} is '{1}' after the change (wanted '{2}') - probably a policy or another security product overrides it." -f $name, $now.$name, $settings[$name])
+            }
+        }
+    } catch { Add-TaskProblem "The Defender settings could not be read back to check them: $($_.Exception.Message)" }
 
     Write-Log ('  definitions before: {0} ({1:yyyy-MM-dd HH:mm})' -f $status.AntivirusSignatureVersion, $status.AntivirusSignatureLastUpdated) Debug
     Write-Log '  checking for definition updates ...'
@@ -847,14 +1184,15 @@ function Task-defender {
         $after = Get-MpComputerStatus
         Write-Log ('  definitions now: {0} ({1:yyyy-MM-dd HH:mm})' -f $after.AntivirusSignatureVersion, $after.AntivirusSignatureLastUpdated) Success
     } catch {
-        Write-Log "  definition update failed: $($_.Exception.Message) (Windows Update will retry automatically)" Warn
+        Add-TaskProblem "Definition update failed: $($_.Exception.Message) (Windows Update will retry automatically)"
     }
 
     if (-not $status.IsTamperProtected) {
         Write-Log '  Tamper Protection is OFF. It can only be enabled manually: Windows Security > Virus & threat protection > Manage settings > Tamper Protection.' Warn
         Add-Advice 'Turn on Tamper Protection: Windows Security > Virus & threat protection > Manage settings.'
     }
-    Write-Log 'Microsoft Defender configured.' Success
+    if ($sync.Problems.Count -gt 0) { Write-Log 'Microsoft Defender configured, but not every setting took effect (see the warnings above).' Warn }
+    else { Write-Log 'Microsoft Defender configured.' Success }
 }
 
 function Get-AsrRuleSets {
@@ -883,42 +1221,224 @@ function Get-AsrRuleSets {
     return @{ Block = $block; Audit = $audit }
 }
 
-function Task-asr {
-    $pref = Get-MpPreference -ErrorAction Stop
-    $backup = Join-Path $sync.StateDir 'asr-backup.json'
-    if (-not (Test-Path -LiteralPath $backup)) {
-        $saved = [pscustomobject]@{
-            # @($null) would be a 1-element array, so drop the null a PC without ASR rules returns.
-            Ids     = @($pref.AttackSurfaceReductionRules_Ids | Where-Object { $_ })
-            Actions = @($pref.AttackSurfaceReductionRules_Actions | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
-            Saved   = (Get-Date).ToString('s')
-        }
-        ConvertTo-Json -InputObject $saved -Depth 4 | Set-Content -LiteralPath $backup -Encoding UTF8
-        Write-Log "  previous ASR configuration saved to $backup" Debug
-    }
+function Get-AsrRuleIds {
     $sets = Get-AsrRuleSets
-    $ok = 0; $failed = 0
+    @($sets.Block.Keys) + @($sets.Audit.Keys) | ForEach-Object { $_.ToLowerInvariant() }
+}
+
+function Get-AsrRuleName {
+    param([string]$Id)
+    $sets = Get-AsrRuleSets
+    if ($sets.Block.Contains($Id)) { return $sets.Block[$Id] }
+    if ($sets.Audit.Contains($Id)) { return $sets.Audit[$Id] }
+    return $Id
+}
+
+function Get-AsrCurrentMap {
+    # Rule id (lower case) -> action (0 off, 1 block, 2 audit, 6 warn) as Defender has it now.
+    $pref = Get-MpPreference -ErrorAction Stop
+    $ids = @($pref.AttackSurfaceReductionRules_Ids); $acts = @($pref.AttackSurfaceReductionRules_Actions)
+    $map = @{}
+    for ($i = 0; $i -lt $ids.Count; $i++) {
+        if (-not $ids[$i]) { continue }
+        $map[([string]$ids[$i]).Trim('{}').ToLowerInvariant()] = $(if ($i -lt $acts.Count -and $null -ne $acts[$i]) { [int]$acts[$i] } else { 0 })
+    }
+    return $map
+}
+
+function Get-JsonValues {
+    # Plain values of a JSON array (also inside the {"value":[...]} wrapper of Windows PowerShell 5.1).
+    param($Node)
+    if ($null -eq $Node) { return }
+    if ($Node -is [array]) { foreach ($x in $Node) { Get-JsonValues $x }; return }
+    if ($Node -is [string] -or $Node -is [ValueType]) { $Node; return }
+    if (@($Node.PSObject.Properties | ForEach-Object { $_.Name }) -contains 'value') { Get-JsonValues $Node.value }
+}
+
+function Read-AsrBackup {
+    # Returns one record per rule this tool sets: Id, Existed (was it configured before?), Action (its
+    # action then). Throws if the file is not a valid backup.
+    param([string]$File)
+    $b = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $File -Raw -ErrorAction Stop)
+    if ($null -eq $b) { throw 'the file is empty' }
+    $known = @(Get-AsrRuleIds)
+    $props = @($b.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($props -contains 'Rules') {
+        foreach ($r in @(Expand-JsonNode $b.Rules)) {
+            $id = ([string]$r.Id).Trim('{}').ToLowerInvariant()
+            if ($known -notcontains $id) { throw "unexpected rule id '$($r.Id)'" }
+            $action = 0
+            if ($r.Existed) {
+                $action = [int]$r.Action
+                if (@(0, 1, 2, 6) -notcontains $action) { throw "unexpected action '$($r.Action)' for rule $id" }
+            }
+            [pscustomobject]@{ Id = $id; Existed = [bool]$r.Existed; Action = $action }
+        }
+    } elseif ($props -contains 'Ids') {
+        # Version 1.0.x saved the complete previous rule list; only the rules this tool sets are taken from it.
+        $savedIds = @(Get-JsonValues $b.Ids); $savedActions = @(Get-JsonValues $b.Actions)
+        $previous = @{}
+        for ($i = 0; $i -lt $savedIds.Count; $i++) {
+            $previous[([string]$savedIds[$i]).Trim('{}').ToLowerInvariant()] = $(if ($i -lt $savedActions.Count) { [int]$savedActions[$i] } else { 0 })
+        }
+        foreach ($id in $known) {
+            [pscustomobject]@{ Id = $id; Existed = $previous.ContainsKey($id); Action = $(if ($previous.ContainsKey($id)) { $previous[$id] } else { 0 }) }
+        }
+    } else {
+        throw 'the file is not an ASR backup'
+    }
+}
+
+function Task-asr {
+    $sets = Get-AsrRuleSets
+    $backup = Join-Path $sync.StateDir 'asr-backup.json'
+    if (Test-Path -LiteralPath $backup) {
+        # The oldest backup holds the state from before this tool first changed the rules: keep it, but it
+        # has to be usable, or Revert could not undo what happens next.
+        try { $null = @(Read-AsrBackup $backup) }
+        catch { throw "The ASR backup $backup cannot be read ($($_.Exception.Message)). Nothing was changed. Move the file away (or repair it) and run the task again." }
+    } else {
+        $current = Get-AsrCurrentMap
+        $rules = @(Get-AsrRuleIds | ForEach-Object {
+            [pscustomobject]@{ Id = $_; Existed = $current.ContainsKey($_); Action = $(if ($current.ContainsKey($_)) { $current[$_] } else { 0 }) }
+        })
+        ConvertTo-Json -InputObject ([pscustomobject]@{ Version = 2; Rules = $rules; Saved = (Get-Date).ToString('s') }) -Depth 5 |
+            Set-Content -LiteralPath $backup -Encoding UTF8 -ErrorAction Stop
+        Write-Log "  previous state of the ASR rules saved to $backup" Debug
+    }
+    $ok = 0
     foreach ($id in $sets.Block.Keys) {
         try {
             Add-MpPreference -AttackSurfaceReductionRules_Ids $id -AttackSurfaceReductionRules_Actions Enabled -ErrorAction Stop
             Write-Log ('  BLOCK  {0}' -f $sets.Block[$id]) Debug; $ok++
-        } catch { Write-Log ('  failed: {0} - {1}' -f $sets.Block[$id], $_.Exception.Message) Warn; $failed++ }
+        } catch { Add-TaskProblem ('Could not set ASR rule "{0}": {1}' -f $sets.Block[$id], $_.Exception.Message) }
     }
     foreach ($id in $sets.Audit.Keys) {
         try {
             Add-MpPreference -AttackSurfaceReductionRules_Ids $id -AttackSurfaceReductionRules_Actions AuditMode -ErrorAction Stop
             Write-Log ('  AUDIT  {0}' -f $sets.Audit[$id]) Debug; $ok++
-        } catch { Write-Log ('  failed: {0} - {1}' -f $sets.Audit[$id], $_.Exception.Message) Warn; $failed++ }
+        } catch { Add-TaskProblem ('Could not set ASR rule "{0}": {1}' -f $sets.Audit[$id], $_.Exception.Message) }
     }
     if ($ok -eq 0) { throw 'No ASR rule could be applied (is Defender active?).' }
-    Write-Log ("Attack Surface Reduction: {0} rules applied{1}." -f $ok, $(if ($failed) { ", $failed failed" } else { '' })) Success
+
+    # Check what Defender actually has now.
+    try {
+        $now = Get-AsrCurrentMap
+        foreach ($id in $sets.Block.Keys) { if ($now[$id] -ne 1) { Add-TaskProblem ('ASR rule "{0}" is not in block mode after the change.' -f $sets.Block[$id]) } }
+        foreach ($id in $sets.Audit.Keys) { if ($now[$id] -ne 2) { Add-TaskProblem ('ASR rule "{0}" is not in audit mode after the change.' -f $sets.Audit[$id]) } }
+    } catch { Add-TaskProblem "The ASR rules could not be read back to check them: $($_.Exception.Message)" }
+
+    if ($sync.Problems.Count -gt 0) { Write-Log 'Attack Surface Reduction: not every rule is active (see the warnings above).' Warn }
+    else { Write-Log ("Attack Surface Reduction: {0} rules applied and checked." -f $ok) Success }
     Write-Log '  If a legitimate program is blocked later, look in Windows Security > Protection history and add an exclusion with Add-MpPreference -AttackSurfaceReductionOnlyExclusions.' Debug
 }
 
+function Restore-AsrBackup {
+    $file = Join-Path $sync.StateDir 'asr-backup.json'
+    if (-not (Test-Path -LiteralPath $file)) { Write-Log '  no ASR backup - the ASR rules were not changed by this tool and are left as they are.'; return }
+    $rules = @()
+    try { $rules = @(Read-AsrBackup $file) }
+    catch { Add-TaskProblem "The ASR backup $file cannot be read ($($_.Exception.Message)) - the ASR rules were NOT changed. The file is kept."; return }
+    $current = $null
+    try { $current = Get-AsrCurrentMap }
+    catch { Add-TaskProblem "The Defender settings cannot be read ($($_.Exception.Message)) - the ASR rules were not changed."; return }
+
+    # Only the rules this tool sets are touched; rules configured by anyone else stay as they are.
+    $failed = New-Object System.Collections.ArrayList
+    foreach ($r in $rules) {
+        try {
+            if ($r.Existed) {
+                if ($current[$r.Id] -ne $r.Action) {
+                    Add-MpPreference -AttackSurfaceReductionRules_Ids $r.Id -AttackSurfaceReductionRules_Actions $r.Action -ErrorAction Stop
+                }
+            } elseif ($current.ContainsKey($r.Id)) {
+                try { Remove-MpPreference -AttackSurfaceReductionRules_Ids $r.Id -ErrorAction Stop }
+                catch { Write-Log ('  removing "{0}": {1} - it is set to Disabled instead' -f (Get-AsrRuleName $r.Id), $_.Exception.Message) Debug }
+            }
+        } catch {
+            [void]$failed.Add($r)
+            Add-TaskProblem ('ASR rule "{0}" could not be restored: {1}' -f (Get-AsrRuleName $r.Id), $_.Exception.Message)
+        }
+    }
+    try {
+        # A rule that was not configured before and is still listed is set to Disabled (0) - the same effect.
+        $now = Get-AsrCurrentMap
+        foreach ($r in $rules) {
+            if ($failed.Contains($r) -or $r.Existed) { continue }
+            if ($now.ContainsKey($r.Id) -and $now[$r.Id] -ne 0) {
+                try { Add-MpPreference -AttackSurfaceReductionRules_Ids $r.Id -AttackSurfaceReductionRules_Actions 0 -ErrorAction Stop } catch { }
+            }
+        }
+        $now = Get-AsrCurrentMap
+        foreach ($r in $rules) {
+            if ($failed.Contains($r)) { continue }
+            $back = if ($r.Existed) { $now[$r.Id] -eq $r.Action } else { (-not $now.ContainsKey($r.Id)) -or $now[$r.Id] -eq 0 }
+            if (-not $back) { [void]$failed.Add($r); Add-TaskProblem ('ASR rule "{0}" is not back in its previous state.' -f (Get-AsrRuleName $r.Id)) }
+        }
+    } catch {
+        Add-TaskProblem "The ASR rules could not be read back to check them ($($_.Exception.Message)); the backup is kept for the next revert."
+        $failed.Clear(); foreach ($r in $rules) { [void]$failed.Add($r) }
+    }
+    $remaining = $null
+    if ($failed.Count -gt 0) { $remaining = [pscustomobject]@{ Version = 2; Rules = @($failed); Saved = (Get-Date).ToString('s') } }
+    Complete-BackupFile -File $file -RemainingObject $remaining
+    if ($failed.Count -gt 0) { Write-Log ('  ASR: {0} of {1} rule(s) restored; the rest stays in the backup.' -f ($rules.Count - $failed.Count), $rules.Count) Warn }
+    else { Write-Log ('  ASR rules set by this tool are back in their previous state ({0} checked).' -f $rules.Count) Success }
+}
+
+function Get-CfaModeName {
+    param([int]$Mode)
+    switch ($Mode) {
+        0 { 'Disabled' } 1 { 'Enabled' } 2 { 'AuditMode' } 3 { 'BlockDiskModificationOnly' } 4 { 'AuditDiskModificationOnly' }
+        default { throw "unknown Controlled Folder Access mode $Mode" }
+    }
+}
+
+function Read-CfaBackup {
+    param([string]$File)
+    $b = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $File -Raw -ErrorAction Stop)
+    if ($null -eq $b -or $null -eq $b.Previous) { throw 'the file is not a Controlled Folder Access backup' }
+    $mode = [int]$b.Previous
+    $null = Get-CfaModeName $mode   # validates the value
+    return $mode
+}
+
 function Task-cfa {
+    $file = Join-Path $sync.StateDir 'cfa-backup.json'
+    if (Test-Path -LiteralPath $file) {
+        try { $null = Read-CfaBackup $file }
+        catch { throw "The Controlled Folder Access backup $file cannot be read ($($_.Exception.Message)). Nothing was changed. Move the file away and run the task again." }
+    } else {
+        $mode = [int](Get-MpPreference -ErrorAction Stop).EnableControlledFolderAccess
+        ConvertTo-Json -InputObject ([pscustomobject]@{ Previous = $mode; Saved = (Get-Date).ToString('s') }) |
+            Set-Content -LiteralPath $file -Encoding UTF8 -ErrorAction Stop
+        Write-Log ('  previous mode saved: {0}' -f (Get-CfaModeName $mode)) Debug
+    }
     Set-MpPreference -EnableControlledFolderAccess Enabled -ErrorAction Stop
-    Write-Log 'Controlled Folder Access enabled (block mode).' Success
+    $now = [int](Get-MpPreference -ErrorAction Stop).EnableControlledFolderAccess
+    if ($now -ne 1) {
+        Add-TaskProblem ('Controlled Folder Access is "{0}" after the change - a policy probably overrides it.' -f (Get-CfaModeName $now))
+    } else {
+        Write-Log 'Controlled Folder Access enabled (block mode).' Success
+    }
     Add-Advice 'Controlled Folder Access is on: if a trusted program cannot save to Documents/Pictures, allow it in Windows Security > Ransomware protection.'
+}
+
+function Restore-CfaBackup {
+    $file = Join-Path $sync.StateDir 'cfa-backup.json'
+    if (-not (Test-Path -LiteralPath $file)) { Write-Log '  no Controlled Folder Access backup - it was not changed by this tool and is left as it is.'; return }
+    $mode = $null
+    try { $mode = Read-CfaBackup $file }
+    catch { Add-TaskProblem "The Controlled Folder Access backup $file cannot be read ($($_.Exception.Message)) - it was NOT changed. The file is kept."; return }
+    try {
+        Set-MpPreference -EnableControlledFolderAccess (Get-CfaModeName $mode) -ErrorAction Stop
+        $now = [int](Get-MpPreference -ErrorAction Stop).EnableControlledFolderAccess
+        if ($now -ne $mode) { throw ('it is "{0}" after the change' -f (Get-CfaModeName $now)) }
+        Complete-BackupFile -File $file
+        Write-Log ('  Controlled Folder Access is back to its previous mode: {0}.' -f (Get-CfaModeName $mode)) Success
+    } catch {
+        Add-TaskProblem ('Controlled Folder Access could not be set back to {0}: {1}. The backup is kept.' -f (Get-CfaModeName $mode), $_.Exception.Message)
+    }
 }
 
 function Task-firewall {
@@ -926,31 +1446,69 @@ function Task-firewall {
     if ($svc.StartType -ne 'Automatic') { Set-Service -Name mpssvc -StartupType Automatic; Write-Log '  firewall service set to Automatic' Debug }
     if ($svc.Status -ne 'Running') { Start-Service -Name mpssvc; Write-Log '  firewall service started' Debug }
     Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow -NotifyOnListen True -ErrorAction Stop
-    foreach ($p in Get-NetFirewallProfile) {
-        Write-Log ('  {0}: enabled={1}, inbound default={2}' -f $p.Name, $p.Enabled, $p.DefaultInboundAction) Debug
-    }
-    Write-Log 'Windows Firewall is on for all profiles (inbound blocked by default).' Success
+    # Check the policy in effect (ActiveStore), not only the local settings just written: Group Policy or a
+    # third-party firewall can override them.
+    try {
+        foreach ($p in @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)) {
+            Write-Log ('  {0} (in effect): enabled={1}, inbound default={2}' -f $p.Name, $p.Enabled, $p.DefaultInboundAction) Debug
+            if ("$($p.Enabled)" -ne 'True') {
+                Add-TaskProblem ('The {0} profile is still OFF in the policy in effect - Group Policy or another firewall product overrides the local setting.' -f $p.Name)
+            } elseif ("$($p.DefaultInboundAction)" -eq 'Allow') {
+                Add-TaskProblem ('The {0} profile still allows inbound connections by default in the policy in effect (Group Policy overrides it).' -f $p.Name)
+            }
+        }
+    } catch { Add-TaskProblem "The firewall policy in effect could not be read to check it: $($_.Exception.Message)" }
+    if ($sync.Problems.Count -gt 0) { Write-Log 'Windows Firewall: local settings applied, but the policy in effect differs (see the warnings above).' Warn }
+    else { Write-Log 'Windows Firewall is on for all profiles (inbound blocked by default).' Success }
 }
 
 function Task-legacy {
     $features = @('SMB1Protocol', 'SMB1Protocol-Client', 'SMB1Protocol-Server', 'SMB1Protocol-Deprecation',
                   'MicrosoftWindowsPowerShellV2Root', 'MicrosoftWindowsPowerShellV2')
+    # List all optional features once. If DISM cannot do that, stop: a broken DISM must not be mistaken for
+    # "the feature does not exist on this PC".
+    $installed = @{}
+    try {
+        foreach ($f in @(Get-WindowsOptionalFeature -Online -ErrorAction Stop)) { $installed[$f.FeatureName.ToLowerInvariant()] = $f }
+    } catch { throw "The list of Windows optional features could not be read (DISM): $($_.Exception.Message)" }
+
+    $present = @($features | Where-Object { $installed.ContainsKey($_.ToLowerInvariant()) })
+    $restartPending = $false
     foreach ($name in $features) {
-        # A feature this Windows build does not have must be skipped, whichever way DISM reports it.
-        $feat = $null
-        try { $feat = Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction Stop } catch { $feat = $null }
-        if (-not $feat) { continue }
-        if ($feat.State -eq 'Enabled') {
+        if ($present -notcontains $name) { Write-Log "  $name is not part of this Windows build" Debug; continue }
+        $state = "$($installed[$name.ToLowerInvariant()].State)"
+        if ($state -eq 'Enabled' -or $state -eq 'EnablePending') {
             Write-Log "  disabling optional feature $name ..."
-            $r = Disable-WindowsOptionalFeature -Online -FeatureName $name -NoRestart -ErrorAction Stop
-            if ($r.RestartNeeded) { $sync.NeedReboot = $true }
-            Write-Log "  $name disabled$(if ($r.RestartNeeded) { ' (restart needed)' })" Debug
+            try {
+                $r = Disable-WindowsOptionalFeature -Online -FeatureName $name -NoRestart -ErrorAction Stop
+                if ($r.RestartNeeded) { $sync.NeedReboot = $true; $restartPending = $true }
+                Write-Log "  $name disabled$(if ($r.RestartNeeded) { ' (restart needed)' })" Debug
+            } catch { Add-TaskProblem "Could not disable ${name}: $($_.Exception.Message)" }
         } else {
-            Write-Log "  $name already $($feat.State)" Debug
+            Write-Log "  $name already $state" Debug
         }
     }
-    try { Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop; Write-Log '  SMB server: SMB1 disabled' Debug } catch { }
-    Write-Log 'Legacy components (SMBv1, PowerShell 2.0) are disabled.' Success
+    # Verify the result instead of assuming it.
+    foreach ($name in $present) {
+        try {
+            $state = "$((Get-WindowsOptionalFeature -Online -FeatureName $name -ErrorAction Stop).State)"
+            if (@('Disabled', 'DisablePending', 'DisabledWithPayloadRemoved') -notcontains $state) {
+                Add-TaskProblem "$name is still '$state' after the change."
+            }
+            if ($state -eq 'DisablePending') { $sync.NeedReboot = $true; $restartPending = $true }
+        } catch { Add-TaskProblem "The state of $name could not be checked: $($_.Exception.Message)" }
+    }
+    try { Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop; Write-Log '  SMB server: SMB1 disabled' Debug }
+    catch { Write-Log "  SMB server configuration: $($_.Exception.Message)" Debug }
+    try {
+        if ((Get-SmbServerConfiguration -ErrorAction Stop).EnableSMB1Protocol) {
+            if ($restartPending) { Write-Log '  the SMB server still reports SMB1 until the restart' Debug }
+            else { Add-TaskProblem 'The SMB server still reports SMB1 as enabled.' }
+        }
+    } catch { Write-Log "  SMB server configuration could not be read: $($_.Exception.Message)" Debug }
+
+    if ($sync.Problems.Count -gt 0) { Write-Log 'Legacy components: not everything could be disabled (see the warnings above).' Warn }
+    else { Write-Log ('Legacy components (SMBv1, PowerShell 2.0) are disabled{0}.' -f $(if ($restartPending) { ' - restart to finish' } else { '' })) Success }
 }
 
 function Task-harden {
@@ -991,29 +1549,172 @@ function Task-harden {
     Write-Log 'Safe defaults applied (Explorer changes appear after sign-out; LSA protection after a restart).' Success
 }
 
+function Get-RdpRuleGroup { '@FirewallAPI.dll,-28752' }   # the "Remote Desktop" firewall rule group, in any language
+
 function Task-network {
+    $nbFile  = Join-Path $sync.StateDir 'netbios-backup.json'
+    $rdpFile = Join-Path $sync.StateDir 'rdp-firewall-backup.json'
+    # Version 1.0.x left only this marker. If it is there, NetBIOS and the RDP rules were already changed by
+    # 1.0.x, so their current state is not the original one: Revert then uses the 1.0.x method for them.
+    $legacyMarker = Test-Path -LiteralPath (Join-Path $sync.StateDir 'network-applied')
+
+    # Existing backups hold the original settings: they must be readable before anything is changed.
+    $nbBackup = @()
+    if (Test-Path -LiteralPath $nbFile) {
+        try { $nbBackup = @(Read-JsonArray $nbFile) }
+        catch { throw "The NetBIOS backup $nbFile cannot be read ($($_.Exception.Message)). Nothing was changed. Move the file away and run the task again." }
+    }
+    if (Test-Path -LiteralPath $rdpFile) {
+        try { $null = @(Read-JsonArray $rdpFile) }
+        catch { throw "The Remote Desktop firewall backup $rdpFile cannot be read ($($_.Exception.Message)). Nothing was changed. Move the file away and run the task again." }
+    }
+
     Write-Log '  disabling LLMNR ...'
     Set-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast' 0
 
     Write-Log '  disabling NetBIOS over TCP/IP on IP-enabled adapters ...'
-    foreach ($nic in @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE')) {
+    $nics = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' -ErrorAction Stop)
+    if (-not $legacyMarker) {
+        # Save each adapter's current mode before the first change (adapters already in the backup keep their
+        # older, original entry).
+        $known = @($nbBackup | ForEach-Object { ([string]$_.SettingID).ToLowerInvariant() })
+        $added = 0
+        foreach ($nic in $nics) {
+            if ($known -contains ([string]$nic.SettingID).ToLowerInvariant()) { continue }
+            $nbBackup += [pscustomobject]@{
+                SettingID = [string]$nic.SettingID; Description = [string]$nic.Description
+                TcpipNetbiosOptions = $(if ($null -ne $nic.TcpipNetbiosOptions) { [int]$nic.TcpipNetbiosOptions } else { 0 })
+                Saved = (Get-Date).ToString('s')
+            }
+            $added++
+        }
+        if ($added -gt 0) { Save-JsonArray -File $nbFile -Items $nbBackup; Write-Log "  previous NetBIOS settings saved to $nbFile" Debug }
+    }
+    foreach ($nic in $nics) {
         try {
             $r = Invoke-CimMethod -InputObject $nic -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = [uint32]2 } -ErrorAction Stop
-            Write-Log ('  {0}: result {1}' -f $nic.Description, $r.ReturnValue) Debug
-            if ($r.ReturnValue -eq 1) { $sync.NeedReboot = $true }
-        } catch { Write-Log ('  {0}: {1}' -f $nic.Description, $_.Exception.Message) Warn }
+            switch ([int]$r.ReturnValue) {
+                0       { Write-Log ('  {0}: NetBIOS off' -f $nic.Description) Debug }
+                1       { Write-Log ('  {0}: NetBIOS off after a restart' -f $nic.Description) Debug; $sync.NeedReboot = $true }
+                default { Add-TaskProblem ('{0}: NetBIOS could not be disabled (SetTcpipNetbios returned {1}).' -f $nic.Description, $r.ReturnValue) }
+            }
+        } catch { Add-TaskProblem ('{0}: NetBIOS could not be disabled: {1}' -f $nic.Description, $_.Exception.Message) }
     }
 
     Write-Log '  disabling Remote Assistance and incoming Remote Desktop ...'
     Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowToGetHelp' 0
     Set-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' 1
-    try {
-        Disable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction Stop   # "Remote Desktop" rule group (language independent)
-        Write-Log '  Remote Desktop firewall rules disabled' Debug
-    } catch { Write-Log "  Remote Desktop firewall rules: $($_.Exception.Message)" Debug }
+    $group = Get-RdpRuleGroup
+    $rules = @(Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue)
+    if (-not $legacyMarker -and -not (Test-Path -LiteralPath $rdpFile)) {
+        # Each rule's own enabled state, so Revert re-enables exactly the rules that were enabled before.
+        Save-JsonArray -File $rdpFile -Items @($rules | ForEach-Object {
+            [pscustomobject]@{ Name = $_.Name; DisplayName = $_.DisplayName; Enabled = ("$($_.Enabled)" -eq 'True') }
+        })
+        Write-Log "  state of $($rules.Count) Remote Desktop firewall rule(s) saved to $rdpFile" Debug
+    }
+    if ($rules.Count -gt 0) {
+        try { Disable-NetFirewallRule -Group $group -ErrorAction Stop; Write-Log '  Remote Desktop firewall rules disabled' Debug }
+        catch { Add-TaskProblem "The Remote Desktop firewall rules could not be disabled: $($_.Exception.Message)" }
+    } else {
+        Write-Log '  no Remote Desktop firewall rules on this PC' Debug
+    }
 
-    Set-Content -LiteralPath (Join-Path $sync.StateDir 'network-applied') -Value (Get-Date).ToString('s')
-    Write-Log 'Network hardening applied.' Success
+    if ($sync.Problems.Count -gt 0) { Write-Log 'Network hardening applied with problems (see the warnings above).' Warn }
+    else { Write-Log 'Network hardening applied.' Success }
+}
+
+function Restore-NetBiosBackup {
+    param([string]$File)
+    $entries = @()
+    try { $entries = @(Read-JsonArray $File) }
+    catch { Add-TaskProblem "The NetBIOS backup $File cannot be read ($($_.Exception.Message)) - NetBIOS was NOT changed. The file is kept."; return }
+    $nics = @()
+    try { $nics = @(Get-CimInstance Win32_NetworkAdapterConfiguration -ErrorAction Stop) }
+    catch { Add-TaskProblem "The network adapters cannot be listed ($($_.Exception.Message)) - NetBIOS was not changed."; return }
+    $keep = New-Object System.Collections.ArrayList
+    $restored = 0
+    foreach ($e in $entries) {
+        $id = [string]$e.SettingID
+        if (-not (Test-GuidText $id) -or $null -eq $e.TcpipNetbiosOptions -or @(0, 1, 2) -notcontains [int]$e.TcpipNetbiosOptions) {
+            Add-TaskProblem "Ignored an invalid NetBIOS backup entry ('$($e.Description)')."
+            continue
+        }
+        $nic = $nics | Where-Object { "$($_.SettingID)" -eq $id } | Select-Object -First 1
+        if (-not $nic -or -not $nic.IPEnabled) {
+            Add-TaskProblem ("Adapter '{0}' is not present or not connected - its NetBIOS setting stays in the backup. Run Revert again when it is connected." -f $e.Description)
+            [void]$keep.Add($e); continue
+        }
+        try {
+            $r = Invoke-CimMethod -InputObject $nic -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = [uint32][int]$e.TcpipNetbiosOptions } -ErrorAction Stop
+            if (@(0, 1) -notcontains [int]$r.ReturnValue) { throw "SetTcpipNetbios returned $($r.ReturnValue)" }
+            if ([int]$r.ReturnValue -eq 1) { $sync.NeedReboot = $true }
+            $restored++
+        } catch {
+            Add-TaskProblem ("NetBIOS on '{0}' could not be restored: {1}" -f $e.Description, $_.Exception.Message)
+            [void]$keep.Add($e)
+        }
+    }
+    Complete-BackupFile -File $File -Remaining @($keep)
+    Write-Log ('  NetBIOS restored on {0} adapter(s){1}.' -f $restored, $(if ($keep.Count) { ", $($keep.Count) kept for the next revert" } else { '' })) $(if ($keep.Count) { 'Warn' } else { 'Success' })
+}
+
+function Restore-RdpFirewallBackup {
+    param([string]$File)
+    $entries = @()
+    try { $entries = @(Read-JsonArray $File) }
+    catch { Add-TaskProblem "The Remote Desktop firewall backup $File cannot be read ($($_.Exception.Message)) - the rules were NOT changed. The file is kept."; return }
+    # Only rules that are still in the Remote Desktop group are touched, whatever the file says.
+    $current = @{}
+    foreach ($rule in @(Get-NetFirewallRule -Group (Get-RdpRuleGroup) -ErrorAction SilentlyContinue)) { $current[$rule.Name] = $rule }
+    $keep = New-Object System.Collections.ArrayList
+    $restored = 0
+    foreach ($e in $entries) {
+        $name = [string]$e.Name
+        if (-not $name -or -not $current.ContainsKey($name)) { Write-Log "  firewall rule '$($e.DisplayName)' is no longer a Remote Desktop rule on this PC - skipped" Debug; continue }
+        try {
+            if ($e.Enabled -eq $true) { Enable-NetFirewallRule -Name $name -ErrorAction Stop }
+            else { Disable-NetFirewallRule -Name $name -ErrorAction Stop }
+            $restored++
+        } catch {
+            Add-TaskProblem ("Firewall rule '{0}' could not be restored: {1}" -f $e.DisplayName, $_.Exception.Message)
+            [void]$keep.Add($e)
+        }
+    }
+    Complete-BackupFile -File $File -Remaining @($keep)
+    Write-Log ('  {0} Remote Desktop firewall rule(s) back in their previous state (enabled or disabled, each as before).' -f $restored) $(if ($keep.Count) { 'Warn' } else { 'Success' })
+}
+
+function Restore-NetworkBackups {
+    $marker  = Join-Path $sync.StateDir 'network-applied'
+    $nbFile  = Join-Path $sync.StateDir 'netbios-backup.json'
+    $rdpFile = Join-Path $sync.StateDir 'rdp-firewall-backup.json'
+    if (Test-Path -LiteralPath $nbFile)  { Restore-NetBiosBackup -File $nbFile }
+    if (Test-Path -LiteralPath $rdpFile) { Restore-RdpFirewallBackup -File $rdpFile }
+    if (-not (Test-Path -LiteralPath $marker)) { return }
+
+    # Network hardening applied by version 1.0.x, which saved no per-adapter or per-rule state.
+    $ok = $true
+    foreach ($nic in @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' -ErrorAction SilentlyContinue)) {
+        # 0 = the Windows default (use the setting from the DHCP server)
+        try {
+            $r = Invoke-CimMethod -InputObject $nic -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = [uint32]0 } -ErrorAction Stop
+            if (@(0, 1) -notcontains [int]$r.ReturnValue) { throw "SetTcpipNetbios returned $($r.ReturnValue)" }
+        } catch { $ok = $false; Add-TaskProblem ("NetBIOS on '{0}' could not be set back to the default: {1}" -f $nic.Description, $_.Exception.Message) }
+    }
+    # The rule group is re-opened only if Remote Desktop itself is allowed again (restored in the registry step).
+    $rdpDenied = 1
+    try { $rdpDenied = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections } catch { $rdpDenied = 1 }
+    $rdpText = 'Remote Desktop is off, its firewall rules stay disabled'
+    if ($rdpDenied -eq 0) {
+        $rdpText = 'Remote Desktop firewall rules re-enabled'
+        try { Enable-NetFirewallRule -Group (Get-RdpRuleGroup) -ErrorAction Stop }
+        catch { $ok = $false; Add-TaskProblem "The Remote Desktop firewall rules could not be re-enabled: $($_.Exception.Message)" }
+    }
+    if ($ok) {
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+        Write-Log "  NetBIOS set back to the Windows default; $rdpText (settings made by version 1.0.x)." Success
+    }
 }
 
 function Task-dns {
@@ -1021,54 +1722,97 @@ function Task-dns {
     $adapters = @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' })
     if ($adapters.Count -eq 0) { throw 'No active physical network adapter found.' }
 
-    # Save the current servers of every adapter that is not in the backup yet (an adapter that was offline
-    # during an earlier run must be saved now, or "Revert hardening" would leave it on Quad9).
+    # The backup must be readable before DNS is changed: it may hold the only record of the original servers.
     $backup = @()
-    $backupReadable = $true
     if (Test-Path -LiteralPath $file) {
         try { $backup = @(Read-JsonArray $file) }
-        catch { $backupReadable = $false; Write-Log "  the existing DNS backup $file could not be read and is left untouched: $($_.Exception.Message)" Warn }
+        catch { throw "The DNS backup $file cannot be read ($($_.Exception.Message)). DNS was NOT changed. Move the file away (or repair it) and run the task again." }
     }
-    $knownGuids = @($backup | ForEach-Object { $_.Guid })
+    # Save the current servers of every adapter that is not in the backup yet (an adapter that was offline
+    # during an earlier run is saved now). If they cannot be read reliably, stop before changing anything.
+    $knownGuids = @($backup | ForEach-Object { ([string]$_.Guid).ToLowerInvariant() })
     $added = 0
     foreach ($a in $adapters) {
-        if (-not $backupReadable) { break }
-        $g = $a.InterfaceGuid
-        if ($knownGuids -contains $g) { continue }
-        $v4 = $null; $v6 = $null
-        try { $v4 = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$g" -Name NameServer -ErrorAction Stop).NameServer } catch { }
-        try { $v6 = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$g" -Name NameServer -ErrorAction Stop).NameServer } catch { }
-        $servers = @()
-        foreach ($s in @($v4, $v6)) { if ($s) { $servers += @($s -split '[,\s]+' | Where-Object { $_ }) } }
+        $g = [string]$a.InterfaceGuid
+        if ($knownGuids -contains $g.ToLowerInvariant()) { continue }
+        $servers = $null
+        try { $servers = @(Get-StaticDnsServers -Guid $g) }
+        catch { throw "The current DNS servers of '$($a.Name)' could not be read ($($_.Exception.Message)). DNS was NOT changed." }
         $backup += [pscustomobject]@{ InterfaceIndex = $a.InterfaceIndex; Name = $a.Name; Guid = $g; StaticServers = $servers; Saved = (Get-Date).ToString('s') }
         $added++
     }
     if ($added -gt 0) {
-        ConvertTo-Json -InputObject @($backup) -Depth 4 | Set-Content -LiteralPath $file -Encoding UTF8
+        Save-JsonArray -File $file -Items $backup
         Write-Log "  previous DNS settings saved to $file" Debug
     }
 
     $quad9 = @('9.9.9.9', '149.112.112.112', '2620:fe::fe', '2620:fe::9')
+    $done = 0
     foreach ($a in $adapters) {
-        Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses $quad9 -ErrorAction Stop
-        Write-Log "  '$($a.Name)': DNS -> Quad9" Debug
+        try {
+            Set-DnsClientServerAddress -InterfaceIndex $a.InterfaceIndex -ServerAddresses $quad9 -ErrorAction Stop
+            Write-Log "  '$($a.Name)': DNS -> Quad9" Debug
+            $done++
+        } catch { Add-TaskProblem "Could not set Quad9 on '$($a.Name)': $($_.Exception.Message)" }
     }
+    if ($done -eq 0) { throw 'Quad9 could not be set on any adapter (see the warnings above).' }
     Clear-DnsClientCache
-    Write-Log 'DNS set to Quad9 (malware-blocking) on all active adapters. "Revert hardening" restores the previous servers.' Success
+    if ($sync.Problems.Count -gt 0) { Write-Log "DNS set to Quad9 on $done of $($adapters.Count) adapter(s)." Warn }
+    else { Write-Log 'DNS set to Quad9 (malware-blocking) on all active adapters. "Revert hardening" restores the previous servers.' Success }
+}
+
+function Get-StaticDnsServers {
+    # The DNS servers set by hand on an adapter (none = automatic via DHCP), read from where Windows keeps
+    # them. A missing interface key means none are set; any other read error is passed on to the caller.
+    param([Parameter(Mandatory)][string]$Guid)
+    $servers = @()
+    foreach ($stack in @('Tcpip', 'Tcpip6')) {
+        $keyPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$stack\Parameters\Interfaces\$Guid"
+        $key = $null
+        try { $key = Get-Item -LiteralPath $keyPath -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] { continue }
+        $value = $key.GetValue('NameServer', $null)
+        if ($value) { $servers += @("$value" -split '[,\s]+' | Where-Object { $_ }) }
+    }
+    foreach ($s in $servers) {
+        $ip = $null
+        if (-not [System.Net.IPAddress]::TryParse($s, [ref]$ip)) { throw "unexpected NameServer value '$s'" }
+    }
+    $servers
 }
 
 function Restore-DnsBackup {
     $file = Join-Path $sync.StateDir 'dns-backup.json'
-    if (-not (Test-Path -LiteralPath $file)) { return }
-    $entries = @(Read-JsonArray $file)
-    $allAdapters = @(Get-NetAdapter -ErrorAction SilentlyContinue)
+    if (-not (Test-Path -LiteralPath $file)) { Write-Log '  no DNS backup - DNS was not changed by this tool.'; return }
+    $entries = @()
+    try { $entries = @(Read-JsonArray $file) }
+    catch { Add-TaskProblem "The DNS backup $file cannot be read ($($_.Exception.Message)) - DNS was NOT changed. The file is kept."; return }
+    $allAdapters = @()
+    try { $allAdapters = @(Get-NetAdapter -ErrorAction Stop) }
+    catch { Add-TaskProblem "The network adapters cannot be listed ($($_.Exception.Message)) - DNS was not changed."; return }
+    $keep = New-Object System.Collections.ArrayList
+    $restored = 0
     foreach ($e in $entries) {
+        $servers = @($e.StaticServers | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        $bad = @($servers | Where-Object { $ip = $null; -not [System.Net.IPAddress]::TryParse($_, [ref]$ip) })
+        if ($bad.Count -gt 0 -or ($e.Guid -and -not (Test-GuidText ([string]$e.Guid)))) {
+            Add-TaskProblem "Ignored an invalid DNS backup entry for '$($e.Name)'."
+            continue
+        }
+        $index = $null
+        if ($e.Guid) {
+            # By GUID only: the interface index of a removed adapter may now belong to a different one.
+            $index = $allAdapters | Where-Object { "$($_.InterfaceGuid)" -eq [string]$e.Guid } | Select-Object -First 1 -ExpandProperty InterfaceIndex
+            if ($null -eq $index) {
+                Add-TaskProblem "Adapter '$($e.Name)' is not present - its DNS setting stays in the backup. Run Revert again when it is connected."
+                [void]$keep.Add($e); continue
+            }
+        } else {
+            # Entry without a GUID (not written by current versions): the saved interface index is all there is.
+            $index = $allAdapters | Where-Object { $_.InterfaceIndex -eq $e.InterfaceIndex } | Select-Object -First 1 -ExpandProperty InterfaceIndex
+            if ($null -eq $index) { Add-TaskProblem "Adapter '$($e.Name)' (interface $($e.InterfaceIndex)) is not present - its DNS setting stays in the backup."; [void]$keep.Add($e); continue }
+        }
         try {
-            # Find the adapter by its GUID first: the interface index can change after a driver update.
-            $index = $null
-            if ($e.Guid) { $index = $allAdapters | Where-Object { $_.InterfaceGuid -eq $e.Guid } | Select-Object -First 1 -ExpandProperty InterfaceIndex }
-            if ($null -eq $index) { $index = (Get-NetAdapter -InterfaceIndex $e.InterfaceIndex -ErrorAction Stop).InterfaceIndex }
-            $servers = @($e.StaticServers | Where-Object { $_ })
             Set-DnsClientServerAddress -InterfaceIndex $index -ResetServerAddresses -ErrorAction Stop
             if ($servers.Count -gt 0) {
                 Set-DnsClientServerAddress -InterfaceIndex $index -ServerAddresses $servers -ErrorAction Stop
@@ -1076,11 +1820,15 @@ function Restore-DnsBackup {
             } else {
                 Write-Log ('  DNS on {0} restored to automatic (DHCP)' -f $e.Name) Debug
             }
-        } catch { Write-Log ('  could not restore DNS on {0} (interface {1}): {2}' -f $e.Name, $e.InterfaceIndex, $_.Exception.Message) Warn }
+            $restored++
+        } catch {
+            Add-TaskProblem ('Could not restore DNS on {0}: {1}' -f $e.Name, $_.Exception.Message)
+            [void]$keep.Add($e)
+        }
     }
-    Move-Item -LiteralPath $file -Destination ($file + '.restored_' + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force
-    Clear-DnsClientCache
-    Write-Log 'DNS settings restored.' Success
+    Complete-BackupFile -File $file -Remaining @($keep)
+    try { Clear-DnsClientCache } catch { }
+    Write-Log ('  DNS restored on {0} adapter(s){1}.' -f $restored, $(if ($keep.Count) { ", $($keep.Count) kept for the next revert" } else { '' })) $(if ($keep.Count) { 'Warn' } else { 'Success' })
 }
 
 function Task-wu {
@@ -1112,23 +1860,37 @@ function Task-wu {
     $downloader = $session.CreateUpdateDownloader()
     $downloader.Updates = $toInstall
     $dres = $downloader.Download()
-    if ($dres.ResultCode -notin @(2, 3)) { throw "Download failed (result code $($dres.ResultCode), HRESULT 0x$('{0:X8}' -f $dres.HResult))." }
-
-    Write-Log '  installing ...'
-    $installer = $session.CreateUpdateInstaller()
-    $installer.Updates = $toInstall
-    $ires = $installer.Install()
+    # Result codes (OperationResultCode): 2 succeeded, 3 succeeded with errors, 4 failed, 5 aborted.
+    # Every update is checked on its own; only the ones that downloaded are installed.
+    $downloaded = New-Object -ComObject Microsoft.Update.UpdateColl
     for ($i = 0; $i -lt $toInstall.Count; $i++) {
-        $rc = $ires.GetUpdateResult($i).ResultCode
-        $text = switch ($rc) { 2 { 'installed' } 3 { 'installed with errors' } 4 { 'FAILED' } 5 { 'aborted' } default { "result $rc" } }
-        Write-Log ('  {0}: {1}' -f $text, $toInstall.Item($i).Title) $(if ($rc -eq 2) { 'Debug' } else { 'Warn' })
+        $u = $toInstall.Item($i)
+        $r = $dres.GetUpdateResult($i)
+        if ($u.IsDownloaded -and $r.ResultCode -in @(2, 3)) { [void]$downloaded.Add($u) }
+        else { Add-TaskProblem ('Download failed (result {0}, HRESULT 0x{1:X8}): {2}' -f $r.ResultCode, $r.HResult, $u.Title) }
+    }
+    if ($downloaded.Count -eq 0) { throw "No update could be downloaded (result code $($dres.ResultCode), HRESULT 0x$('{0:X8}' -f $dres.HResult))." }
+
+    Write-Log "  installing $($downloaded.Count) update(s) ..."
+    $installer = $session.CreateUpdateInstaller()
+    $installer.Updates = $downloaded
+    $ires = $installer.Install()
+    $installed = 0
+    for ($i = 0; $i -lt $downloaded.Count; $i++) {
+        $r = $ires.GetUpdateResult($i)
+        $title = $downloaded.Item($i).Title
+        switch ($r.ResultCode) {
+            2       { Write-Log "  installed: $title" Debug; $installed++ }
+            3       { Add-TaskProblem ('Installed with errors (HRESULT 0x{0:X8}): {1}' -f $r.HResult, $title); $installed++ }
+            4       { Add-TaskProblem ('Installation FAILED (HRESULT 0x{0:X8}): {1}' -f $r.HResult, $title) }
+            5       { Add-TaskProblem "Installation aborted: $title" }
+            default { Add-TaskProblem ('Installation result {0} (HRESULT 0x{1:X8}): {2}' -f $r.ResultCode, $r.HResult, $title) }
+        }
     }
     if ($ires.RebootRequired) { $sync.NeedReboot = $true }
-    if ($ires.ResultCode -in @(2, 3)) {
-        Write-Log ("Windows Update: {0} update(s) processed{1}." -f $toInstall.Count, $(if ($ires.RebootRequired) { ' - restart required' } else { '' })) Success
-    } else {
-        throw "Installation finished with result code $($ires.ResultCode) (HRESULT 0x$('{0:X8}' -f $ires.HResult))."
-    }
+    if ($installed -eq 0) { throw "No update could be installed (result code $($ires.ResultCode), HRESULT 0x$('{0:X8}' -f $ires.HResult))." }
+    $msg = 'Windows Update: {0} of {1} update(s) installed{2}.' -f $installed, $toInstall.Count, $(if ($ires.RebootRequired) { ' - restart required' } else { '' })
+    Write-Log $msg $(if ($sync.Problems.Count -gt 0) { 'Warn' } else { 'Success' })
 }
 
 function Task-winget {
@@ -1201,15 +1963,34 @@ function Task-autoruns {
     foreach ($t in $tools) {
         $dir = Join-Path $root $t.Name
         $zip = Get-Download -Url $t.Zip -FileName (($t.Name -replace ' ', '') + '.zip')
+        # Unpack into the protected download folder and check EVERY program file of the archive before
+        # anything is copied to Program Files. Only signed programs and plain documents are installed.
+        $stage = [IO.Path]::GetFullPath((Join-Path $sync.DownloadDir (($t.Name -replace ' ', '') + '-unpacked')))
+        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        Expand-Archive -LiteralPath $zip -DestinationPath $stage -Force
+        if (-not (Test-Path -LiteralPath (Join-Path $stage $t.Exe))) { throw "$($t.Exe) not found in the downloaded archive." }
+        $deploy = @()
+        foreach ($f in @(Get-ChildItem -LiteralPath $stage -Recurse -File)) {
+            $ext = $f.Extension.ToLowerInvariant()
+            if (@('.exe', '.dll', '.sys') -contains $ext) { Test-FileSignature -Path $f.FullName -Signer 'Microsoft'; $deploy += $f }
+            elseif (@('.txt', '.chm') -contains $ext) { $deploy += $f }
+            else { Write-Log "  not installed (unexpected file type): $($f.Name)" Debug }
+        }
         if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+        foreach ($f in $deploy) {
+            $relative = $f.FullName.Substring($stage.Length).TrimStart('\')
+            $target = Join-Path $dir $relative
+            $targetDir = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
+            Copy-Item -LiteralPath $f.FullName -Destination $target -Force
+        }
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
         $exePath = Join-Path $dir $t.Exe
-        if (-not (Test-Path -LiteralPath $exePath)) { throw "$($t.Exe) not found in the downloaded archive." }
-        Test-FileSignature -Path $exePath -Signer 'Microsoft'
         Set-RegValue -Path $t.RegKey -Name 'EulaAccepted' -Value 1 -NoBackup
         New-Shortcut -Target $exePath -ShortcutPath (Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\Sysinternals\$($t.Name).lnk") -Description "Sysinternals $($t.Name)"
-        Write-Log "  $($t.Name) -> $dir" Debug
+        Write-Log "  $($t.Name) -> $dir ($($deploy.Count) file(s), all programs signature-checked)" Debug
     }
     Add-Advice 'Run Autoruns (Start menu > Sysinternals) and enable Options > Scan Options > Check VirusTotal.com to review everything that starts with Windows.'
     Write-Log 'Sysinternals Autoruns and Process Explorer installed (Start menu > Sysinternals).' Success
@@ -1244,14 +2025,23 @@ function Task-upgradeall {
     switch ($code) {
         0             { Write-Log 'All programs known to winget are up to date.' Success }
         (-1978335189) { Write-Log 'No upgrades available.' Success }
-        default       { Write-Log ('winget upgrade finished with 0x{0:X8} - some packages may have failed (see log above).' -f $code) Warn }
+        default       { Add-TaskProblem ('winget upgrade finished with code 0x{0:X8} ({0}): at least one program was not updated (see the winget output above).' -f $code) }
     }
 }
 
 function Task-scan {
     Write-Log '  running a Defender quick scan (typically 5-15 minutes) ...'
     Start-MpScan -ScanType QuickScan -ErrorAction Stop
-    $threats = @(Get-MpThreatDetection -ErrorAction SilentlyContinue | Sort-Object InitialDetectionTime -Descending | Select-Object -First 10)
+    $threats = @()
+    try {
+        $threats = @(Get-MpThreatDetection -ErrorAction Stop | Sort-Object InitialDetectionTime -Descending | Select-Object -First 10)
+    } catch {
+        # "No objects found" just means no detection was ever recorded; anything else means the history is unknown.
+        if ($_.CategoryInfo.Category -ne [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
+            Add-TaskProblem "The scan finished, but the detection history could not be read ($($_.Exception.Message)). Check Windows Security > Virus & threat protection > Protection history."
+            return
+        }
+    }
     if ($threats.Count -eq 0) {
         Write-Log 'Quick scan finished - no threats recorded.' Success
     } else {
@@ -1265,99 +2055,87 @@ function Task-scan {
     }
 }
 
+function Restore-RegistryBackup {
+    $file = Get-RegBackupPath
+    if (-not (Test-Path -LiteralPath $file)) { Write-Log '  no registry backup found - nothing to restore.'; return }
+    $list = @()
+    try { $list = @(Read-JsonArray $file) }
+    catch { Add-TaskProblem "The registry backup $file cannot be read ($($_.Exception.Message)) - registry values were NOT restored. The file is kept."; return }
+    $allowedKinds = @('DWord', 'QWord', 'String', 'ExpandString', 'MultiString', 'Binary')
+    $seen = @{}
+    $keep = New-Object System.Collections.ArrayList
+    $restored = 0
+    $legacyUser = $false
+    foreach ($e in $list) {
+        if (-not $e.Path -or -not $e.Name) { continue }
+        # The first entry for a value holds the state from before the tool touched it.
+        $id = Get-RegEntryId $e
+        if ($seen.ContainsKey($id)) { continue }
+        $seen[$id] = $true
+        $path = [string]$e.Path
+        $shown = '{0}\{1}' -f (Format-RegPath $path), $e.Name
+        # Only values this tool changes, of ordinary types, are written - whatever the file says.
+        if (-not (Test-RegAllowed $path $e.Name) -or ($e.Existed -and $allowedKinds -notcontains [string]$e.Kind)) {
+            Add-TaskProblem "Ignored a backup entry for $shown (not a value this tool changes)."
+            continue
+        }
+        if ($path -match '^HKCU:') {
+            # Saved by version 1.0.x, which did not record whose setting it was.
+            $legacyUser = $true
+            $path = Resolve-RegPath $path
+        }
+        if ($path -match '^Registry::HKEY_USERS\\(S-1-[0-9]+(-[0-9]+)+)\\') {
+            $sid = $Matches[1]
+            if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$sid")) {
+                Add-TaskProblem ("$shown belongs to the account {0}, which is not signed in - it stays in the backup. Sign in with that account, then run Revert again." -f (Get-AccountName $sid))
+                [void]$keep.Add($e); continue
+            }
+        }
+        try {
+            if ($e.Existed) {
+                if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force -ErrorAction Stop | Out-Null }
+                $val = $e.Value
+                if ($e.Kind -eq 'Binary' -and $null -ne $val) { $val = [byte[]]@($val) }
+                if ($e.Kind -eq 'MultiString') { $val = [string[]]@($val) }
+                New-ItemProperty -LiteralPath $path -Name $e.Name -Value $val -PropertyType $e.Kind -Force -ErrorAction Stop | Out-Null
+                Write-Log "  restored $shown = $val" Debug
+            } else {
+                if ((Test-Path -LiteralPath $path) -and (@((Get-Item -LiteralPath $path -ErrorAction Stop).GetValueNames()) -contains $e.Name)) {
+                    Remove-ItemProperty -LiteralPath $path -Name $e.Name -ErrorAction Stop
+                }
+                Write-Log "  removed $shown" Debug
+            }
+            $restored++
+        } catch {
+            Add-TaskProblem "Could not restore ${shown}: $($_.Exception.Message)"
+            [void]$keep.Add($e)
+        }
+    }
+    if ($legacyUser) {
+        Write-Log ('  Per-user values saved by version 1.0.x were restored into the account {0} (1.0.x did not record whose they were).' -f (Get-AccountName $sync.UserSid)) Warn
+    }
+    Complete-BackupFile -File $file -Remaining @($keep)
+    Write-Log ('  {0} registry value(s) restored{1}.' -f $restored, $(if ($keep.Count) { ", $($keep.Count) kept for the next revert" } else { '' })) $(if ($keep.Count) { 'Warn' } else { 'Success' })
+}
+
 function Task-revert {
     Write-Log 'Reverting hardening changes made by this tool ...' Step
-
-    # 1. Registry values
-    $file = Get-RegBackupPath
-    if (Test-Path -LiteralPath $file) {
-        $list = @(Read-JsonArray $file)
-        $seen = @{}
-        $count = 0
-        foreach ($e in $list) {
-            if (-not $e.Path -or -not $e.Name) { continue }
-            # The first entry for a value holds the state from before the tool touched it.
-            $id = ('{0}|{1}' -f $e.Path, $e.Name).ToLower()
-            if ($seen.ContainsKey($id)) { continue }
-            $seen[$id] = $true
-            $count++
-            try {
-                if ($e.Existed) {
-                    if (-not (Test-Path -LiteralPath $e.Path)) { New-Item -Path $e.Path -Force | Out-Null }
-                    $val = $e.Value
-                    if ($e.Kind -eq 'Binary' -and $null -ne $val) { $val = [byte[]]@($val) }
-                    if ($e.Kind -eq 'MultiString') { $val = [string[]]@($val) }
-                    New-ItemProperty -LiteralPath $e.Path -Name $e.Name -Value $val -PropertyType $e.Kind -Force | Out-Null
-                    Write-Log ('  restored {0}\{1} = {2}' -f ($e.Path -replace ':', ''), $e.Name, $val) Debug
-                } else {
-                    Remove-ItemProperty -LiteralPath $e.Path -Name $e.Name -ErrorAction SilentlyContinue
-                    Write-Log ('  removed {0}\{1}' -f ($e.Path -replace ':', ''), $e.Name) Debug
-                }
-            } catch { Write-Log ('  could not restore {0}\{1}: {2}' -f $e.Path, $e.Name, $_.Exception.Message) Warn }
-        }
-        Move-Item -LiteralPath $file -Destination ($file + '.restored_' + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force
-        Write-Log "  $count registry value(s) restored." Success
-    } else {
-        Write-Log '  no registry backup found - nothing to restore.'
+    $steps = [ordered]@{
+        'registry values'           = 'Restore-RegistryBackup'
+        'ASR rules'                 = 'Restore-AsrBackup'
+        'Controlled Folder Access'  = 'Restore-CfaBackup'
+        'NetBIOS and Remote Desktop rules' = 'Restore-NetworkBackups'
+        'DNS servers'               = 'Restore-DnsBackup'
     }
-
-    # 2. Defender ASR rules and Controlled Folder Access
-    try {
-        # The ASR rules are only touched when the ASR task saved a backup, i.e. when this tool changed them.
-        $asrFile = Join-Path $sync.StateDir 'asr-backup.json'
-        if (Test-Path -LiteralPath $asrFile) {
-            $pref = Get-MpPreference -ErrorAction Stop
-            $current = @($pref.AttackSurfaceReductionRules_Ids | Where-Object { $_ })
-            if ($current.Count -gt 0) { Remove-MpPreference -AttackSurfaceReductionRules_Ids $current -ErrorAction Stop }
-            $b = ConvertFrom-Json -InputObject (Get-Content -LiteralPath $asrFile -Raw)
-            $savedIds = @($b.Ids); $savedActions = @($b.Actions)
-            $oldIds = @(); $oldActions = @()
-            for ($i = 0; $i -lt $savedIds.Count; $i++) {
-                if (-not $savedIds[$i]) { continue }
-                $oldIds += [string]$savedIds[$i]
-                $oldActions += $(if ($i -lt $savedActions.Count) { [int]$savedActions[$i] } else { 0 })
-            }
-            if ($oldIds.Count -gt 0) {
-                Add-MpPreference -AttackSurfaceReductionRules_Ids $oldIds -AttackSurfaceReductionRules_Actions $oldActions -ErrorAction Stop
-                Write-Log ('  previous ASR configuration restored ({0} rules)' -f $oldIds.Count) Debug
-            } else {
-                Write-Log '  ASR rules removed (none were configured before)' Debug
-            }
-            Move-Item -LiteralPath $asrFile -Destination ($asrFile + '.restored_' + (Get-Date -Format 'yyyyMMdd_HHmmss')) -Force
-            Write-Log '  ASR rules reverted.' Success
-        } else {
-            Write-Log '  no ASR backup found - ASR rules left as they are.'
-        }
-    } catch { Write-Log "  ASR revert: $($_.Exception.Message)" Warn }
-    try {
-        Set-MpPreference -EnableControlledFolderAccess Disabled -ErrorAction Stop
-        Write-Log '  Controlled Folder Access off.' Success
-    } catch { Write-Log "  Controlled Folder Access: $($_.Exception.Message)" Warn }
-
-    # 3. NetBIOS back to default (only if the network task ran)
-    $marker = Join-Path $sync.StateDir 'network-applied'
-    if (Test-Path -LiteralPath $marker) {
-        foreach ($nic in @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE')) {
-            try { Invoke-CimMethod -InputObject $nic -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = [uint32]0 } -ErrorAction Stop | Out-Null } catch { }
-        }
-        # Re-open the Remote Desktop firewall rules only if RDP itself is allowed again (the registry value was
-        # restored in step 1). If RDP was off before the tool ran, its rules were closed too and stay closed.
-        $rdpDenied = 1
-        try { $rdpDenied = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -ErrorAction Stop).fDenyTSConnections } catch { $rdpDenied = 1 }
-        $rdpText = 'Remote Desktop is off, its firewall rules stay disabled'
-        if ($rdpDenied -eq 0) {
-            $rdpText = 'Remote Desktop firewall rules re-enabled'
-            try { Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' -ErrorAction Stop } catch { $rdpText = "Remote Desktop firewall rules could not be re-enabled ($($_.Exception.Message))" }
-        }
-        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
-        Write-Log "  NetBIOS set back to default; $rdpText." Success
+    foreach ($what in $steps.Keys) {
+        try { & $steps[$what] } catch { Add-TaskProblem "Restoring the ${what} stopped: $($_.Exception.Message)" }
     }
-
-    # 4. DNS
-    Restore-DnsBackup
-
     $sync.NeedReboot = $true
-    Write-Log 'Revert finished. Defender settings, firewall, SMBv1/PowerShell 2.0 removal and installed programs were intentionally left in place.' Success
+    if ($sync.Problems.Count -gt 0) {
+        Write-Log ('Revert finished with {0} problem(s). Whatever could not be restored is kept in the backups in {1} - fix the cause and run Revert again.' -f $sync.Problems.Count, $sync.StateDir) Warn
+    } else {
+        Write-Log 'Revert finished. Defender settings, firewall, SMBv1/PowerShell 2.0 removal and installed programs were intentionally left in place.' Success
+    }
 }
 
 # ---- task runner (used by both the GUI worker and the CLI mode) ---------------------------
@@ -1384,10 +2162,16 @@ function Invoke-TaskRun {
         Set-TaskStatus $t.Id 'Running'
         Write-Log ('[{0}/{1}] {2}' -f ($n + 1), $total, $t.Name) Step
         $sw = [Diagnostics.Stopwatch]::StartNew()
+        $sync.Problems.Clear()
         try {
             & ('Task-' + $t.Id)
-            Set-TaskStatus $t.Id 'Done'
-            Write-Log ('  finished in {0:N0} s' -f $sw.Elapsed.TotalSeconds) Debug
+            if ($sync.Problems.Count -gt 0) {
+                Set-TaskStatus $t.Id 'Partial'
+                Write-Log ('  finished in {0:N0} s with {1} problem(s) - see the warnings above' -f $sw.Elapsed.TotalSeconds, $sync.Problems.Count) Warn
+            } else {
+                Set-TaskStatus $t.Id 'Done'
+                Write-Log ('  finished in {0:N0} s' -f $sw.Elapsed.TotalSeconds) Debug
+            }
         } catch {
             Set-TaskStatus $t.Id 'Failed'
             Write-Log ('FAILED: {0} - {1}' -f $t.Name, $_.Exception.Message) Error
@@ -1397,8 +2181,9 @@ function Invoke-TaskRun {
     $sync.Progress = 100
 
     $done = @($sync.Results.Values | Where-Object { $_ -eq 'Done' }).Count
+    $partial = @($sync.Results.Values | Where-Object { $_ -eq 'Partial' }).Count
     $failed = @($sync.Results.Values | Where-Object { $_ -eq 'Failed' }).Count
-    Write-Log ('All tasks processed: {0} succeeded, {1} failed{2}.' -f $done, $failed, $(if ($sync.NeedReboot) { ' - a RESTART is required to finish' } else { '' })) Step
+    Write-Log ('All tasks processed: {0} succeeded, {1} partly succeeded, {2} failed{3}.' -f $done, $partial, $failed, $(if ($sync.NeedReboot) { ' - a RESTART is required to finish' } else { '' })) Step
     if ($sync.Advice.Count -gt 0) {
         Write-Log 'Next steps for you:' Step
         foreach ($a in $sync.Advice) { Write-Log "  * $a" }
@@ -1413,22 +2198,26 @@ $SharedFunctions = @(Get-ChildItem Function: | Where-Object { $__fnBefore -notco
 #  end of shared region
 # ===========================================================================================
 
+# Problems found while securing the state folder (logged now that logging works).
+foreach ($w in $StartupWarnings) { Write-Log $w Warn }
+
 # ===========================================================================================
 #  CLI mode
 # ===========================================================================================
 if ($Tasks) {
-    $known = @($TaskDefs | ForEach-Object { $_.Id })
-    $invalid = @($Tasks | Where-Object { $known -notcontains $_ })
-    if ($invalid.Count -gt 0) {
-        Write-Host ("Unknown task id(s): {0}. Use -ListTasks to see the available ids." -f ($invalid -join ', ')) -ForegroundColor Red
-        exit 2
-    }
     Write-Host ''
     Write-Host "Windows 10 Security Pack $ToolVersion - command-line mode" -ForegroundColor Cyan
     Invoke-TaskRun -Ids $Tasks
     if ($sync.NeedReboot) { Write-Host 'A restart is required to complete the changes.' -ForegroundColor Yellow }
-    $anyFailed = @($sync.Results.Values | Where-Object { $_ -eq 'Failed' }).Count -gt 0
-    exit $(if ($anyFailed) { 1 } else { 0 })
+    $notOk = @($sync.Results.Values | Where-Object { $_ -eq 'Failed' -or $_ -eq 'Partial' }).Count -gt 0
+    $exitCode = $(if ($notOk) { 1 } else { 0 })
+    if ($Elevated) {
+        # This is the separate administrator window opened by the UAC prompt: keep it open to be read.
+        # The window that started the tool waits for it and receives the exit code.
+        Write-Host ''
+        Read-Host 'Finished. Press Enter to close this window' | Out-Null
+    }
+    exit $exitCode
 }
 
 # ===========================================================================================
@@ -1472,15 +2261,15 @@ function Add-LogLine {
     $rtb.AppendText($line + "`r`n")
     $rtb.SelectionStart = $rtb.TextLength
     $rtb.ScrollToCaret()
-    try {
-        $fileLine = '[{0:yyyy-MM-dd HH:mm:ss}] [{1,-7}] {2}' -f $Entry.Time, $Entry.Level.ToUpper(), $Entry.Message
-        [IO.File]::AppendAllText($sync.LogFile, $fileLine + [Environment]::NewLine, [Text.Encoding]::UTF8)
-    } catch { }
+    # The log file was already written by Write-Log / Write-UiLog when the entry was created.
 }
 
 function Write-UiLog {
     param([string]$Message, [string]$Level = 'Info')
-    Add-LogLine ([pscustomobject]@{ Time = Get-Date; Level = $Level; Message = $Message })
+    $entry = [pscustomobject]@{ Time = Get-Date; Level = $Level; Message = $Message }
+    Write-LogFile $entry
+    Add-LogLine $entry
+    Drain-Queues   # shows a log-file write error, if Write-LogFile just queued one
 }
 
 function Update-ItemStatus {
@@ -1494,6 +2283,7 @@ function Update-ItemStatus {
         'Running'   { [System.Drawing.Color]::RoyalBlue }
         'Cancelled' { [System.Drawing.Color]::Gray }
         'Queued'    { [System.Drawing.Color]::DimGray }
+        'Partial'   { [System.Drawing.Color]::DarkOrange }
         default     { [System.Drawing.SystemColors]::WindowText }
     }
     $item.UseItemStyleForSubItems = $false
@@ -1564,14 +2354,21 @@ function Fill-StatusList {
 function Show-RunSummary {
     param([string]$Kind)
     $done = @($sync.Results.Values | Where-Object { $_ -eq 'Done' }).Count
+    $partial = @($sync.Results.Values | Where-Object { $_ -eq 'Partial' }).Count
     $failed = @($sync.Results.Values | Where-Object { $_ -eq 'Failed' }).Count
     $sb = New-Object System.Text.StringBuilder
     if ($Kind -eq 'revert') {
-        [void]$sb.AppendLine('Revert finished.')
+        if ($failed + $partial -gt 0) {
+            [void]$sb.AppendLine('Revert finished, but not everything could be restored.')
+            [void]$sb.AppendLine('What could not be restored is kept in the backups - see the log, fix the cause and run Revert again.')
+        } else {
+            [void]$sb.AppendLine('Revert finished.')
+        }
     } else {
-        [void]$sb.AppendLine(('{0} task(s) succeeded, {1} failed.' -f $done, $failed))
+        [void]$sb.AppendLine(('{0} task(s) succeeded, {1} partly succeeded, {2} failed.' -f $done, $partial, $failed))
+        if ($failed + $partial -gt 0) { [void]$sb.AppendLine('See the warnings in the log for what did not work.') }
     }
-    if ($failed -gt 0) { [void]$sb.AppendLine('See the log for details of the failures.') }
+    $failed += $partial   # for the icon below
     if ($sync.Advice.Count -gt 0) {
         [void]$sb.AppendLine()
         [void]$sb.AppendLine('Next steps for you:')
@@ -1821,7 +2618,7 @@ $ui.BtnCancel.add_Click({
 
 $ui.BtnRevert.add_Click({
     if ($script:Worker) { return }
-    $msg = "This restores the registry values, Attack Surface Reduction rules, DNS servers and NetBIOS/Remote Desktop settings changed by this tool (from its backups in $StateDir) and turns Controlled Folder Access off.`r`n`r`nDefender settings, the firewall, SMBv1/PowerShell 2.0 removal and installed programs are kept.`r`n`r`nContinue?"
+    $msg = "This restores what this tool changed - registry values, its Attack Surface Reduction rules, Controlled Folder Access, DNS servers, NetBIOS and the Remote Desktop firewall rules - to the state saved in its backups in $StateDir.`r`n`r`nDefender settings, the firewall, SMBv1/PowerShell 2.0 removal and installed programs are kept.`r`n`r`nContinue?"
     $r = [System.Windows.Forms.MessageBox]::Show($ui.Form, $msg, 'Revert hardening', 'YesNo', 'Warning', 'Button2')
     if ($r -ne 'Yes') { return }
     Reset-RunState

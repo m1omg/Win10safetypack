@@ -34,7 +34,10 @@ Sources: [Microsoft ESU page](https://www.microsoft.com/windows/extended-securit
 | `logs\` | Created on first run; one log file per session. (Falls back to `C:\ProgramData\Win10SecurityPack\logs` if the folder is read-only.) |
 
 Backups the tool keeps for *Revert hardening* live in `C:\ProgramData\Win10SecurityPack\`
-(`registry-backup.json`, `asr-backup.json`, `dns-backup.json`).
+(`registry-backup.json`, `asr-backup.json`, `cfa-backup.json`, `dns-backup.json`, `netbios-backup.json`,
+`rdp-firewall-backup.json`), together with the `downloads\` folder for installers. On every start the tool
+makes this folder writable by administrators only; anything in it that a non-administrator account created
+or could change is renamed to `*.untrusted_<date>` and never used.
 
 ## How to run it
 
@@ -48,6 +51,8 @@ Backups the tool keeps for *Revert hardening* live in `C:\ProgramData\Win10Secur
 5. Press **Run selected**, confirm, and watch the activity log. The window stays responsive; **Cancel** stops
    after the current task.
 6. When it finishes you get a summary with manual follow-up steps, and a restart prompt if one is needed.
+   Each task ends as **Done**, **Partial** (it ran, but something in it did not take effect - the log says
+   what, e.g. one Windows update failed or a policy overrides a Defender setting) or **Failed**.
 
 Command-line use (also elevates itself):
 
@@ -55,6 +60,10 @@ Command-line use (also elevates itself):
 .\Win10SecurityPack.ps1 -ListTasks
 .\Win10SecurityPack.ps1 -Tasks restore,defender,asr,firewall,legacy,harden,wu
 ```
+
+Started without administrator rights, the command opens an elevated window, waits for it and returns its exit
+code: `0` all tasks done, `1` at least one task failed or was only partly done, `2` unknown task id,
+`3` the state folder could not be secured, `1223` the UAC prompt was declined.
 
 ## The tasks
 
@@ -99,11 +108,16 @@ Default = ticked when the window opens. Everything is explained again inside the
 
 ### Buttons
 
-* **Revert hardening...** - restores backed-up registry values, the previous ASR rule set, DNS servers and
-  NetBIOS/RDP settings; turns Controlled Folder Access off. Defender settings, the firewall, SMBv1/PS2
-  removal and installed programs are intentionally left alone (they are safe to keep).
+* **Revert hardening...** - puts back exactly what the tool changed, from its backups: registry values, the
+  ASR rules it set (rules configured by anyone else are not touched), Controlled Folder Access (to the mode
+  it had before), DNS servers, each adapter's NetBIOS mode and each Remote Desktop firewall rule's own
+  on/off state. What cannot be restored right now - an unplugged adapter, a per-user setting of an account
+  that is not signed in, a failed write - stays in the backup and is tried again by the next revert; the
+  revert is then reported as *Partial*. Defender settings, the firewall, SMBv1/PS2 removal and installed
+  programs are intentionally left alone (they are safe to keep).
 * **Windows Security** / **Windows Update / ESU** - open the corresponding Windows pages.
-* **Open log folder** - the session log is written line by line, so it is complete even after a crash.
+* **Open log folder** - every message is written to the log file the moment it happens (not when the window
+  shows it), so the log is complete even after a crash. If the file cannot be written, the window says so.
 
 ## After the tool has run - things only you can do
 
@@ -127,12 +141,18 @@ Default = ticked when the window opens. Everything is explained again inside the
 * **Developed on Linux, reviewed by hand, not executed on a real Windows 10 machine before delivery.**
   Please run it first on a PC you can restore (the restore-point task runs first for a reason) and read the
   activity log. Report anything odd - the log file contains everything needed to diagnose it.
-* The tool only downloads from the vendors' own domains over HTTPS and refuses to run any file whose
-  Authenticode signature is invalid or from an unexpected publisher. winget packages are hash-verified by
-  winget itself.
+* The tool only downloads from the vendors' own domains over HTTPS, into its administrator-only folder, and
+  refuses to run any file whose Authenticode signature is invalid or whose publisher name is not exactly the
+  vendor's (Microsoft Corporation, Mozilla Corporation, Malwarebytes Inc., and ACROS - the company behind
+  0patch - under its registered Slovenian name). Every
+  program file in the Sysinternals archives is checked before anything is copied to Program Files. winget
+  packages are hash-verified by winget itself.
 * Settings written under `HKEY_CURRENT_USER` (AutoPlay, file extensions, Sysinternals EULA) apply to the
   account that approved the UAC prompt. On a PC where a standard user elevates with a different admin
-  account, the tool logs a warning about this.
+  account, the tool logs a warning about this. The backup records which account they belong to, so Revert
+  puts them back in that account, whichever administrator runs it (that account must be signed in).
+* The firewall check and the status tab read the firewall policy *in effect*, so a Group Policy or another
+  firewall product that overrides the local settings shows up as a problem instead of being hidden.
 * If a **third-party antivirus** is installed, Defender runs in passive mode and the Defender/ASR tasks have
   little effect; the status tab and the log tell you so.
 * Some hardening can interfere with legitimate software: ASR rules (check *Protection history* in Windows
@@ -142,9 +162,10 @@ Default = ticked when the window opens. Everything is explained again inside the
   also store the LSA Protection setting in a firmware variable. Revert restores the registry value, but LSA
   Protection can then stay on until that variable is cleared with Microsoft's
   [LSA Protected Process Opt-out tool](https://www.microsoft.com/download/details.aspx?id=40897).
-* **Revert hardening** only undoes what the tool itself changed: the ASR rules are put back only if the ASR
-  task was run (it never touches rules you configured yourself otherwise), and the Remote Desktop firewall
-  rules are re-enabled only if Remote Desktop was switched on before the *Network hardening* task ran.
+* **Revert hardening** only undoes what the tool itself changed (see *Buttons* above). Changes made with
+  version 1.0.x were not fully recorded: for those, Controlled Folder Access is left as it is (turn it off in
+  Windows Security if you want), NetBIOS goes back to the Windows default and the Remote Desktop rules are
+  re-enabled only if Remote Desktop itself is allowed.
 * The ESU enrolment detection reads a registry key that is community-documented, not officially documented;
   treat "not enrolled" as "check Settings", not as gospel.
 * The SmartScreen, Edge and LLMNR settings are written as *policies* (the same keys Group Policy uses), so
@@ -153,6 +174,30 @@ Default = ticked when the window opens. Everything is explained again inside the
   (which removes those policy values), enrol, then run the hardening again.
 
 ## Changelog
+
+**1.1.0** - safer backups and revert, honest results:
+
+* The state folder `C:\ProgramData\Win10SecurityPack` is made administrator-only on every start; content a
+  standard user could have planted there is set aside unused. Installers are downloaded there instead of
+  `%TEMP%`. Revert only writes registry values from a fixed list and validates every backup entry.
+* Publisher check: the certificate's name must be exactly the vendor's, not just contain it. All program
+  files of the Sysinternals archives are verified before they are installed.
+* Revert: restores only the ASR rules the tool set (after reading the backup, not before); puts Controlled
+  Folder Access back to its previous mode instead of always turning it off; restores each adapter's NetBIOS
+  mode and each Remote Desktop rule's state; puts per-user settings back in the account they came from;
+  finds adapters by GUID only. Anything that could not be restored stays in the backup for the next revert.
+* No task changes DNS, ASR, Controlled Folder Access, NetBIOS or registry values when its backup cannot be
+  read or the original values cannot be determined.
+* New *Partial* result: Windows Update failures, Defender/ASR settings that did not take effect, firewall
+  settings overridden by policy, failed `winget upgrade` packages, an unreadable Defender detection history and
+  features that could not be disabled are no longer reported as success. The command line exits with `1`.
+* The firewall is checked against the policy in effect; a stopped 0patch service is shown red.
+* The SMBv1/PowerShell 2.0 task stops if DISM cannot list the optional features, instead of assuming they
+  are absent, and checks the result.
+* Command line without administrator rights: waits for the elevated run and returns its exit code;
+  `1223` when UAC is declined.
+* The log file is written immediately from the background task, not when the window gets to it; write
+  errors are shown.
 
 **1.0.1** - bug fixes, no change to what the tasks do:
 
